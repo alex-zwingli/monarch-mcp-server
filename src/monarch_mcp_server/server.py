@@ -71,6 +71,7 @@ from monarch_mcp_server.tools.categories import (  # noqa: F401
 from monarch_mcp_server.tools.budgets import (  # noqa: F401
     get_budgets,
     set_budget_amount,
+    set_flexible_budget,
 )
 from monarch_mcp_server.tools.financial import (  # noqa: F401
     get_cashflow,

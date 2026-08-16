@@ -3,7 +3,7 @@
 import calendar
 import logging
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from gql import gql
 from monarchmoney import MonarchMoney
@@ -54,6 +54,130 @@ BUDGET_QUERY = gql(
     """
 )
 
+# BUDGET_QUERY plus the bucket-level amounts Monarch exposes for the
+# "fixed_and_flex" budget system. Under that system the Flexible section carries
+# a single amount covering every category beneath it; without these selections
+# that number is invisible and spending-vs-budget for Flexible cannot be
+# computed (see issue #103).
+#
+# Kept as a separate document, rather than folded into BUDGET_QUERY, so that any
+# account whose API rejects these fields can fall back to the narrow query with
+# its behavior completely unchanged.
+#
+# Note: `budgetVariability` appears below under monthlyAmountsForFlexExpense.
+# That is a *different* subtree from the categoryGroups.budgetVariability field
+# implicated in the original failure -- the categoryGroups selection here stays
+# exactly as narrow as it is in BUDGET_QUERY.
+BUDGET_QUERY_FLEX = gql(
+    """
+    query MCPBudgetDataFlex($startDate: Date!, $endDate: Date!) {
+      budgetData(startMonth: $startDate, endMonth: $endDate) {
+        monthlyAmountsByCategory {
+          category {
+            id
+            __typename
+          }
+          monthlyAmounts {
+            month
+            plannedCashFlowAmount
+            plannedSetAsideAmount
+            actualAmount
+            remainingAmount
+            __typename
+          }
+          __typename
+        }
+        monthlyAmountsForFlexExpense {
+          budgetVariability
+          monthlyAmounts {
+            month
+            plannedCashFlowAmount
+            actualAmount
+            remainingAmount
+            previousMonthRolloverAmount
+            rolloverType
+            __typename
+          }
+          __typename
+        }
+        totalsByMonth {
+          month
+          totalFlexibleExpenses {
+            plannedAmount
+            actualAmount
+            remainingAmount
+            previousMonthRolloverAmount
+            __typename
+          }
+          totalFixedExpenses {
+            plannedAmount
+            actualAmount
+            remainingAmount
+            previousMonthRolloverAmount
+            __typename
+          }
+          totalNonMonthlyExpenses {
+            plannedAmount
+            actualAmount
+            remainingAmount
+            previousMonthRolloverAmount
+            __typename
+          }
+          __typename
+        }
+        __typename
+      }
+      categoryGroups {
+        id
+        name
+        type
+        categories {
+          id
+          name
+          __typename
+        }
+        __typename
+      }
+    }
+    """
+)
+
+# Cached for the life of the process: None = not yet probed, True = the flex
+# fields work, False = this account rejects them so don't pay the failed
+# round-trip again.
+_flex_supported: Optional[bool] = None
+
+# Substrings that mark a GraphQL *validation* failure -- i.e. the server saying
+# these fields don't exist -- as opposed to a transport, auth or rate-limit
+# error that happens to occur on the same call.
+_SCHEMA_REJECTION_MARKERS = (
+    "cannot query field",
+    "unknown field",
+    "no field named",
+    "unknown argument",
+    "did you mean",
+    "validation error",
+    "graphqlerror",
+)
+
+
+def reset_flex_support() -> None:
+    """Clear the cached flex-support result. Intended for tests."""
+    global _flex_supported
+    _flex_supported = None
+
+
+def _is_schema_rejection(exc: Exception) -> bool:
+    """True when *exc* looks like Monarch rejecting the flex fields themselves.
+
+    Only a schema rejection is cached as "flex unsupported". A 401, timeout or
+    connection reset must not permanently latch flex off for the process, and
+    must not be quietly downgraded into a successful-but-incomplete response --
+    those propagate to the caller instead.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in _SCHEMA_REJECTION_MARKERS)
+
 
 def current_month_range() -> tuple[str, str]:
     """Return the current month bounds as ISO date strings."""
@@ -66,17 +190,46 @@ async def get_budget_data(
     client: MonarchMoney,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Fetch budget data using fields supported by Monarch's current API."""
+) -> Tuple[Dict[str, Any], bool]:
+    """Fetch budget data, preferring the query that includes flex bucket totals.
+
+    Returns ``(raw_response, used_flex_query)``. When Monarch rejects the flex
+    selections this falls back to :data:`BUDGET_QUERY`, so accounts that do not
+    support them behave exactly as they did before.
+    """
+    global _flex_supported
+
     default_start, default_end = current_month_range()
-    return await client.gql_call(
+    variables = {
+        "startDate": start_date or default_start,
+        "endDate": end_date or default_end,
+    }
+
+    if _flex_supported is not False:
+        try:
+            data = await client.gql_call(
+                operation="MCPBudgetDataFlex",
+                graphql_query=BUDGET_QUERY_FLEX,
+                variables=variables,
+            )
+            _flex_supported = True
+            return data, True
+        except Exception as exc:
+            if not _is_schema_rejection(exc):
+                raise
+            logger.warning(
+                "Monarch rejected the flex budget fields; falling back to the "
+                "narrow budget query for the rest of this process: %s",
+                exc,
+            )
+            _flex_supported = False
+
+    data = await client.gql_call(
         operation="MCPBudgetData",
         graphql_query=BUDGET_QUERY,
-        variables={
-            "startDate": start_date or default_start,
-            "endDate": end_date or default_end,
-        },
+        variables=variables,
     )
+    return data, False
 
 
 def format_budget_data(budget_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -114,6 +267,94 @@ def format_budget_data(budget_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return budget_rows
 
 
+def _totals_entry(node: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Normalize one of Monarch's planned/actual/remaining total objects."""
+    if not node:
+        return None
+    return {
+        "planned": node.get("plannedAmount"),
+        "actual": node.get("actualAmount"),
+        "remaining": node.get("remainingAmount"),
+        "rollover": node.get("previousMonthRolloverAmount"),
+    }
+
+
+def format_flex_budget(
+    budget_data: Dict[str, Any], used_flex_query: bool
+) -> Dict[str, Any]:
+    """Summarize the Flexible bucket, always reporting *why* it may be empty.
+
+    ``status`` separates three cases that would otherwise be indistinguishable
+    -- and reading "no flex budget" as "$0" would be wrong:
+
+    - ``unsupported``    Monarch rejected the flex fields; the fallback ran
+    - ``not_configured`` the query worked but this account has no flex bucket
+    - ``ok``             a flex bucket is present
+    """
+    if not used_flex_query:
+        return {"status": "unsupported", "budget_variability": None, "monthly": []}
+
+    flex = (budget_data.get("budgetData") or {}).get("monthlyAmountsForFlexExpense")
+    if isinstance(flex, list):
+        entries = flex
+    elif flex:
+        entries = [flex]
+    else:
+        entries = []
+
+    variability: Optional[str] = None
+    monthly: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not entry:
+            continue
+        variability = entry.get("budgetVariability") or variability
+        for amount in entry.get("monthlyAmounts") or []:
+            if not amount:
+                continue
+            monthly.append(
+                {
+                    "month": amount.get("month"),
+                    "planned": amount.get("plannedCashFlowAmount"),
+                    "actual": amount.get("actualAmount"),
+                    "remaining": amount.get("remainingAmount"),
+                    "rollover": amount.get("previousMonthRolloverAmount"),
+                    "rollover_type": amount.get("rolloverType"),
+                }
+            )
+
+    if not monthly:
+        return {
+            "status": "not_configured",
+            "budget_variability": variability,
+            "monthly": [],
+        }
+
+    return {"status": "ok", "budget_variability": variability, "monthly": monthly}
+
+
+def format_budget_totals(
+    budget_data: Dict[str, Any], used_flex_query: bool
+) -> Optional[List[Dict[str, Any]]]:
+    """Per-month fixed/flexible/non-monthly totals, or None when unavailable."""
+    if not used_flex_query:
+        return None
+
+    totals = (budget_data.get("budgetData") or {}).get("totalsByMonth")
+    if not totals:
+        return None
+
+    return [
+        {
+            "month": total.get("month"),
+            "flexible": _totals_entry(total.get("totalFlexibleExpenses")),
+            "fixed": _totals_entry(total.get("totalFixedExpenses")),
+            "non_monthly": _totals_entry(total.get("totalNonMonthlyExpenses")),
+        }
+        for total in totals
+        if total
+    ]
+
+
 @mcp.tool()
 async def get_budgets(
     start_date: Optional[str] = None,
@@ -127,15 +368,35 @@ async def get_budgets(
         end_date: End month in YYYY-MM-DD format (defaults to the current month)
 
     Returns:
-        A JSON list with one row per budgeted category per month. Each row has:
-        ``id`` (category id), ``name`` (category name), ``planned`` (planned
-        cash-flow amount), ``actual`` (actual amount), ``remaining``,
-        ``category_group`` (group name), and ``month`` (YYYY-MM-DD).
+        A JSON object with:
+
+        ``data`` - one row per budgeted category per month, each with ``id``
+        (category id), ``name``, ``planned`` (planned cash-flow amount),
+        ``actual``, ``remaining``, ``category_group`` and ``month``.
+
+        ``flex`` - the all-up Flexible bucket for accounts on Monarch's
+        "fixed_and_flex" budget system, with ``status`` (``ok``,
+        ``not_configured`` or ``unsupported``), ``budget_variability`` and a
+        ``monthly`` list. Under flex budgeting a single amount covers every
+        category in the Flexible section, so this -- not the per-category rows
+        -- is the number to compare spending against. A ``status`` other than
+        ``ok`` means no amount is available; do NOT treat that as zero.
+
+        ``totals`` - per-month ``flexible`` / ``fixed`` / ``non_monthly``
+        totals, or null when this account does not expose them.
     """
     try:
         client = await get_monarch_client()
-        budget_data = await get_budget_data(client, start_date, end_date)
-        return json_success(format_budget_data(budget_data))
+        raw, used_flex_query = await get_budget_data(client, start_date, end_date)
+        return json_success(
+            {
+                "tool": "get_budgets",
+                "args": {"start_date": start_date, "end_date": end_date},
+                "data": format_budget_data(raw),
+                "flex": format_flex_budget(raw, used_flex_query),
+                "totals": format_budget_totals(raw, used_flex_query),
+            }
+        )
     except Exception as e:
         return json_error("get_budgets", e)
 
@@ -153,6 +414,9 @@ async def set_budget_amount(
 
     Use get_budgets() first to see current budgets and category IDs.
     Use get_categories() or get_category_groups() to find category/group IDs.
+
+    Note: this cannot set the all-up Flexible bucket amount -- that bucket is
+    not a category group. Use set_flexible_budget() for it.
 
     Args:
         amount: The budget amount to set. Use 0 to clear/unset the budget.
@@ -210,3 +474,63 @@ async def set_budget_amount(
         })
     except Exception as e:
         return json_error("set_budget_amount", e)
+
+
+@mcp.tool()
+async def set_flexible_budget(
+    amount: float,
+    start_date: Optional[str] = None,
+    apply_to_future: bool = False,
+) -> str:
+    """
+    Set the all-up Flexible bucket budget (Monarch's "fixed_and_flex" system).
+
+    This is the single amount covering every category in the Flexible section.
+    It is not a category or a category group, so set_budget_amount() cannot
+    reach it.
+
+    Args:
+        amount: The budget amount to set. Use 0 to clear/unset it.
+        start_date: The month to set in YYYY-MM-DD format (defaults to current month)
+        apply_to_future: Whether to apply this amount to all future months
+
+    Returns:
+        Result of the update.
+    """
+    try:
+        if _flex_supported is False:
+            return json_success({
+                "success": False,
+                "error": (
+                    "This account does not appear to support Monarch's flexible "
+                    "budget bucket -- the API rejected the flex fields on an "
+                    "earlier get_budgets call."
+                ),
+            })
+
+        client = await get_monarch_client()
+
+        updater = getattr(client, "update_flexible_budget", None)
+        if updater is None:
+            return json_success({
+                "success": False,
+                "error": (
+                    "The installed monarchmoney client has no "
+                    "update_flexible_budget(); upgrade monarchmoneycommunity."
+                ),
+            })
+
+        result = await updater(
+            amount=amount,
+            start_date=start_date,
+            apply_to_future=apply_to_future,
+        )
+
+        return json_success({
+            "success": True,
+            "message": f"Flexible budget set to ${amount:.2f}"
+                       + (" for all future months" if apply_to_future else ""),
+            "result": result,
+        })
+    except Exception as e:
+        return json_error("set_flexible_budget", e)

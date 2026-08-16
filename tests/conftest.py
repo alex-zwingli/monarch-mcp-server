@@ -263,6 +263,16 @@ _TOOL_MODULES = [
 
 
 @pytest.fixture(autouse=True)
+def reset_budget_flex_support():
+    """Keep tests independent of budgets.py's per-process flex-support cache."""
+    from monarch_mcp_server.tools import budgets
+
+    budgets.reset_flex_support()
+    yield
+    budgets.reset_flex_support()
+
+
+@pytest.fixture(autouse=True)
 def patch_monarch_client(mock_monarch_client):
     """Automatically patch get_monarch_client wherever it's imported."""
     patchers = []

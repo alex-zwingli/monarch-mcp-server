@@ -230,8 +230,9 @@ Once authenticated, use these tools directly in Claude Desktop or Claude Code:
 - **Split Transaction**: Divide a single transaction into multiple parts with different categories or merchants
 
 ### 💵 Budget Management
-- **Get Budgets**: Access budget information including spent amounts and remaining balances by category
+- **Get Budgets**: Access budget information including spent amounts and remaining balances by category, plus the all-up **Flexible** bucket and per-month fixed/flexible/non-monthly totals
 - **Set Budget Amount**: Create or modify budget amounts for any category or category group
+- **Set Flexible Budget**: Set the bucket-level Flexible amount used by Monarch's "fixed_and_flex" budget system
 
 ### 📈 Net Worth Tracking
 - **Get Net Worth**: Track total net worth over time with daily snapshots and trend analysis
@@ -259,8 +260,9 @@ Once authenticated, use these tools directly in Claude Desktop or Claude Code:
 | `check_auth_status` | Check authentication status | None |
 | `get_accounts` | Get all financial accounts | None |
 | `get_transactions` | Get transactions with filtering and reconciliation fields | `limit`, `offset`, `start_date`, `end_date`, `account_id`, `account_ids`, `category_ids`, `category_group_ids`, `tag_ids`, `search`, `wide_search`, `search_scan_limit`, `has_notes`, `is_split`, `is_recurring` |
-| `get_budgets` | Get budget information | `start_date`, `end_date` |
+| `get_budgets` | Get budget information, including the Flexible bucket | `start_date`, `end_date` |
 | `set_budget_amount` | Set budget for a category | `amount`, `category_id`, `category_group_id`, `start_date`, `apply_to_future` |
+| `set_flexible_budget` | Set the all-up Flexible bucket amount | `amount`, `start_date`, `apply_to_future` |
 | `get_cashflow` | Get cashflow analysis | `start_date`, `end_date` |
 | `get_net_worth` | Get net worth history | `start_date`, `end_date`, `account_type` |
 | `get_account_balance_history` | Get account balance history | `account_id` |
@@ -312,6 +314,21 @@ Show me my last 50 transactions using get_transactions with limit 50
 ### Check Spending vs Budget
 ```
 Use get_budgets to show my current budget status
+```
+
+`get_budgets` returns a JSON object with `data` (one row per category per month), `flex`, and `totals`. On Monarch's "fixed_and_flex" budget system the Flexible section carries a **single amount covering every category beneath it**, and that number lives in `flex`, not in the per-category rows — comparing spending against the category rows alone will understate the Flexible budget.
+
+`flex.status` is one of:
+
+- `ok` — a Flexible bucket amount was returned
+- `not_configured` — the account has no Flexible bucket (e.g. it is not on flex budgeting)
+- `unsupported` — Monarch rejected the flex fields, so the narrower fallback query ran
+
+A status other than `ok` means **no amount is available — it does not mean zero**. `totals` carries per-month `flexible` / `fixed` / `non_monthly` totals, or `null` when unavailable.
+
+### Set the Flexible Bucket Amount
+```
+Set my flexible budget to $4,000 for this month using set_flexible_budget
 ```
 
 ### Set a Budget Amount
@@ -478,7 +495,7 @@ monarch-mcp-server/
 
 ### Recommended: require approval for mutating tools
 
-Several tools mutate your Monarch ledger (`create_transaction`, `update_transaction`, `delete_transaction`, `bulk_categorize_transactions`, `upload_account_balance_history`, `set_transaction_tags`, `create_transaction_rule`, `update_transaction_rule`, `delete_transaction_rule`, `split_transaction`, `set_budget_amount`, `update_merchant`, `review_recurring_stream`).
+Several tools mutate your Monarch ledger (`create_transaction`, `update_transaction`, `delete_transaction`, `bulk_categorize_transactions`, `upload_account_balance_history`, `set_transaction_tags`, `create_transaction_rule`, `update_transaction_rule`, `delete_transaction_rule`, `split_transaction`, `set_budget_amount`, `set_flexible_budget`, `update_merchant`, `review_recurring_stream`).
 
 Because the LLM can be influenced by data it reads back (a malicious-looking memo or merchant name in a transaction), the safest setup is to configure your MCP client to require manual approval before any mutating tool runs. In Claude Desktop and Claude Code this is the default behavior for unknown tools; keep it that way for the tools listed above rather than allow-listing them.
 
