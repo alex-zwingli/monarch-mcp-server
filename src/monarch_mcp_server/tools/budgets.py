@@ -69,11 +69,37 @@ _CATEGORY_EXTRA = """
             previousMonthRolloverAmount
             rolloverType"""
 
-# Which budget system the account uses ("fixed_and_flex" or otherwise). Lets a
-# caller tell "this account does not do flex budgeting" from "the flex bucket
-# is empty" without inferring it.
+# Root-level extras.
+#
+# - budgetSystem: which system the account uses ("fixed_and_flex" or otherwise).
+#   Lets a caller tell "this account does not do flex budgeting" from "the flex
+#   bucket is empty" without inferring it.
+# - goalsV2: goal contributions are part of the monthly plan and are what
+#   plannedSetAsideAmount refers to, so a budget answer that ignores them
+#   understates what is spoken for. Upstream guards this with
+#   @include(if: $useV2Goals); requested unconditionally here since the whole
+#   document already falls back if Monarch refuses any of it.
 _ROOT_EXTRA = """
-      budgetSystem"""
+      budgetSystem
+      goalsV2 {
+        id
+        name
+        archivedAt
+        completedAt
+        priority
+        plannedContributions(startMonth: $startDate, endMonth: $endDate) {
+          id
+          month
+          amount
+          __typename
+        }
+        monthlyContributionSummaries(startMonth: $startDate, endMonth: $endDate) {
+          month
+          sum
+          __typename
+        }
+        __typename
+      }"""
 
 # Roll-up amounts Monarch exposes above the per-category level. All live under
 # budgetData, so requesting them never widens the categoryGroups selection.
@@ -460,6 +486,49 @@ def format_group_budgets(
     return rows
 
 
+def format_goals(
+    budget_data: Dict[str, Any], used_flex_query: bool
+) -> Optional[List[Dict[str, Any]]]:
+    """Savings goals with their planned and actual monthly contributions.
+
+    Returns None when unavailable. Archived and completed goals are included
+    but flagged, so a caller can exclude them rather than silently miss that
+    they existed.
+    """
+    if not used_flex_query:
+        return None
+
+    goals = budget_data.get("goalsV2")
+    if not goals:
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    for goal in goals:
+        if not goal:
+            continue
+        rows.append(
+            {
+                "id": goal.get("id"),
+                "name": goal.get("name"),
+                "priority": goal.get("priority"),
+                "archived": bool(goal.get("archivedAt")),
+                "completed": bool(goal.get("completedAt")),
+                "planned_contributions": [
+                    {"month": c.get("month"), "amount": c.get("amount")}
+                    for c in goal.get("plannedContributions") or []
+                    if c
+                ],
+                "actual_contributions": [
+                    {"month": s.get("month"), "amount": s.get("sum")}
+                    for s in goal.get("monthlyContributionSummaries") or []
+                    if s
+                ],
+            }
+        )
+
+    return rows
+
+
 @mcp.tool()
 async def get_budgets(
     start_date: Optional[str] = None,
@@ -502,6 +571,12 @@ async def get_budgets(
         null when unavailable. Groups budgeted at the group level rather than
         per category hold their amount here.
 
+        ``goals`` - savings goals with ``planned_contributions`` and
+        ``actual_contributions`` per month, or null when unavailable. Goal
+        contributions are what ``set_aside`` refers to, so a "what is spoken
+        for this month" answer should account for them. ``archived`` and
+        ``completed`` goals are included but flagged.
+
         ``totals`` - per-month ``income``, ``expenses``, ``flexible``,
         ``fixed`` and ``non_monthly`` totals, or null when this account does
         not expose them.
@@ -517,6 +592,7 @@ async def get_budgets(
                 "data": format_budget_data(raw),
                 "flex": format_flex_budget(raw, used_flex_query),
                 "groups": format_group_budgets(raw, used_flex_query),
+                "goals": format_goals(raw, used_flex_query),
                 "totals": format_budget_totals(raw, used_flex_query),
             }
         )

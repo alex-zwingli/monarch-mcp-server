@@ -251,6 +251,53 @@ class TestFlexBucket:
     async def test_budget_system_null_when_absent(self):
         assert json.loads(await get_budgets())["budget_system"] is None
 
+    async def test_reports_goals_with_planned_and_actual_contributions(
+        self, mock_monarch_client
+    ):
+        enriched = with_flex(mock_monarch_client.gql_call.return_value)
+        enriched["goalsV2"] = [
+            {
+                "id": "goal-1",
+                "name": "Emergency Fund",
+                "priority": 1,
+                "archivedAt": None,
+                "completedAt": None,
+                "plannedContributions": [
+                    {"id": "pc-1", "month": "2026-03-01", "amount": 400.00}
+                ],
+                "monthlyContributionSummaries": [
+                    {"month": "2026-03-01", "sum": 250.00}
+                ],
+            },
+            {
+                "id": "goal-2",
+                "name": "Old Goal",
+                "priority": 2,
+                "archivedAt": "2026-01-01",
+                "completedAt": None,
+                "plannedContributions": [],
+                "monthlyContributionSummaries": [],
+            },
+        ]
+        mock_monarch_client.gql_call.return_value = enriched
+
+        goals = json.loads(await get_budgets())["goals"]
+
+        assert goals[0] == {
+            "id": "goal-1",
+            "name": "Emergency Fund",
+            "priority": 1,
+            "archived": False,
+            "completed": False,
+            "planned_contributions": [{"month": "2026-03-01", "amount": 400.00}],
+            "actual_contributions": [{"month": "2026-03-01", "amount": 250.00}],
+        }
+        # Archived goals are surfaced but flagged, not silently dropped.
+        assert goals[1]["archived"] is True
+
+    async def test_goals_null_when_unavailable(self):
+        assert json.loads(await get_budgets())["goals"] is None
+
     async def test_prefers_the_flex_query(self, mock_monarch_client):
         await get_budgets()
         _, kwargs = mock_monarch_client.gql_call.call_args
