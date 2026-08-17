@@ -233,6 +233,7 @@ Once authenticated, use these tools directly in Claude Desktop or Claude Code:
 - **Get Budgets**: Access budget information including spent amounts and remaining balances by category, plus the all-up **Flexible** bucket and per-month fixed/flexible/non-monthly totals
 - **Set Budget Amount**: Create or modify budget amounts for any category or category group
 - **Set Flexible Budget**: Set the bucket-level Flexible amount used by Monarch's "fixed_and_flex" budget system
+- **Update Flex Rollover Settings**: Start a fresh Flex rollover period, for buckets that have accumulated a large negative rollover
 
 ### 📈 Net Worth Tracking
 - **Get Net Worth**: Track total net worth over time with daily snapshots and trend analysis
@@ -263,6 +264,7 @@ Once authenticated, use these tools directly in Claude Desktop or Claude Code:
 | `get_budgets` | Get budget information, including the Flexible bucket | `start_date`, `end_date` |
 | `set_budget_amount` | Set budget for a category | `amount`, `category_id`, `category_group_id`, `start_date`, `apply_to_future` |
 | `set_flexible_budget` | Set the all-up Flexible bucket amount | `amount`, `start_date`, `apply_to_future` |
+| `update_flex_rollover_settings` | Start a new Flex rollover period (**discards accumulated rollover**) | `rollover_start_month`, `rollover_starting_balance`, `rollover_enabled` |
 | `get_cashflow` | Get cashflow analysis | `start_date`, `end_date` |
 | `get_net_worth` | Get net worth history | `start_date`, `end_date`, `account_type` |
 | `get_account_balance_history` | Get account balance history | `account_id` |
@@ -495,7 +497,9 @@ monarch-mcp-server/
 
 ### Recommended: require approval for mutating tools
 
-Several tools mutate your Monarch ledger (`create_transaction`, `update_transaction`, `delete_transaction`, `bulk_categorize_transactions`, `upload_account_balance_history`, `set_transaction_tags`, `create_transaction_rule`, `update_transaction_rule`, `delete_transaction_rule`, `split_transaction`, `set_budget_amount`, `set_flexible_budget`, `update_merchant`, `review_recurring_stream`).
+Several tools mutate your Monarch ledger (`create_transaction`, `update_transaction`, `delete_transaction`, `bulk_categorize_transactions`, `upload_account_balance_history`, `set_transaction_tags`, `create_transaction_rule`, `update_transaction_rule`, `delete_transaction_rule`, `split_transaction`, `set_budget_amount`, `set_flexible_budget`, `update_flex_rollover_settings`, `update_merchant`, `review_recurring_stream`).
+
+`update_flex_rollover_settings` deserves particular care: it discards the Flex bucket's accumulated rollover balance and starts a fresh period. Its two destructive arguments are deliberately required rather than defaulted, so it cannot be invoked as a no-argument "reset", but it should still be approved manually every time.
 
 Because the LLM can be influenced by data it reads back (a malicious-looking memo or merchant name in a transaction), the safest setup is to configure your MCP client to require manual approval before any mutating tool runs. In Claude Desktop and Claude Code this is the default behavior for unknown tools; keep it that way for the tools listed above rather than allow-listing them.
 

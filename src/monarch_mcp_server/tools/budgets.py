@@ -657,3 +657,75 @@ async def set_flexible_budget(
         })
     except Exception as e:
         return json_error("set_flexible_budget", e)
+
+
+@mcp.tool()
+async def update_flex_rollover_settings(
+    rollover_start_month: str,
+    rollover_starting_balance: float,
+    rollover_enabled: bool = True,
+) -> str:
+    """
+    Start a new Flex bucket rollover period.
+
+    DESTRUCTIVE: this DISCARDS the rollover balance accumulated so far and
+    begins a fresh period. Its main use is fixing a Flex bucket that has built
+    up a large negative rollover over many months. Confirm with the user before
+    calling, and report the current rollover (get_budgets -> flex.monthly[].
+    rollover) so they know what is being discarded.
+
+    Both amounts are required on purpose -- the underlying client defaults to a
+    starting balance of 0 for the current month, i.e. a silent full reset, so
+    this tool makes the caller state the intent explicitly.
+
+    Args:
+        rollover_start_month: First month of the new period, YYYY-MM-DD
+            (use the first of the month, e.g. "2026-08-01")
+        rollover_starting_balance: Balance to seed the new period with. Pass 0
+            to clear accumulated rollover entirely.
+        rollover_enabled: Whether flex rollover stays enabled (default True)
+
+    Returns:
+        Result of the update, including the new rollover period.
+    """
+    try:
+        if _flex_supported is False:
+            return json_success({
+                "success": False,
+                "error": (
+                    "This account does not appear to support Monarch's flexible "
+                    "budget bucket -- the API rejected the flex fields on an "
+                    "earlier get_budgets call."
+                ),
+            })
+
+        client = await get_monarch_client()
+
+        updater = getattr(client, "update_flex_rollover_settings", None)
+        if updater is None:
+            return json_success({
+                "success": False,
+                "error": (
+                    "The installed monarchmoney client has no "
+                    "update_flex_rollover_settings(); upgrade "
+                    "monarchmoneycommunity."
+                ),
+            })
+
+        result = await updater(
+            rollover_start_month=rollover_start_month,
+            rollover_starting_balance=rollover_starting_balance,
+            rollover_enabled=rollover_enabled,
+        )
+
+        return json_success({
+            "success": True,
+            "message": (
+                f"Flex rollover period restarted at {rollover_start_month} with "
+                f"a starting balance of ${rollover_starting_balance:.2f}"
+                + ("" if rollover_enabled else " (rollover disabled)")
+            ),
+            "result": result,
+        })
+    except Exception as e:
+        return json_error("update_flex_rollover_settings", e)

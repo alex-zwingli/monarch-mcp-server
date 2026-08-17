@@ -6,7 +6,11 @@ import pytest
 from gql.transport.exceptions import TransportQueryError, TransportServerError
 
 from monarch_mcp_server.tools import budgets as budgets_module
-from monarch_mcp_server.tools.budgets import get_budgets, set_flexible_budget
+from monarch_mcp_server.tools.budgets import (
+    get_budgets,
+    set_flexible_budget,
+    update_flex_rollover_settings,
+)
 
 FLEX_BLOCK = {
     "budgetVariability": "flexible",
@@ -385,3 +389,70 @@ class TestSetFlexibleBudget:
         result = json.loads(await set_flexible_budget(amount=100))
         assert result["error"] is True
         assert result["tool"] == "set_flexible_budget"
+
+
+class TestUpdateFlexRolloverSettings:
+    async def test_passes_explicit_values_through(self, mock_monarch_client):
+        mock_monarch_client.update_flex_rollover_settings.return_value = {
+            "updateBudgetSettings": {"budgetRolloverPeriod": {"id": "rp-1"}}
+        }
+
+        result = json.loads(
+            await update_flex_rollover_settings(
+                rollover_start_month="2026-08-01", rollover_starting_balance=0
+            )
+        )
+
+        assert result["success"] is True
+        mock_monarch_client.update_flex_rollover_settings.assert_awaited_once_with(
+            rollover_start_month="2026-08-01",
+            rollover_starting_balance=0,
+            rollover_enabled=True,
+        )
+
+    def test_destructive_arguments_are_required(self):
+        # The client defaults to "balance 0, current month" -- a silent full
+        # reset. The tool must force the caller to state both explicitly.
+        import inspect
+
+        params = inspect.signature(update_flex_rollover_settings).parameters
+        assert params["rollover_start_month"].default is inspect.Parameter.empty
+        assert params["rollover_starting_balance"].default is inspect.Parameter.empty
+
+    async def test_refuses_when_flex_known_unsupported(self, mock_monarch_client):
+        budgets_module._flex_supported = False
+
+        result = json.loads(
+            await update_flex_rollover_settings(
+                rollover_start_month="2026-08-01", rollover_starting_balance=0
+            )
+        )
+
+        assert result["success"] is False
+        mock_monarch_client.update_flex_rollover_settings.assert_not_awaited()
+
+    async def test_reports_missing_client_method(self, mock_monarch_client):
+        del mock_monarch_client.update_flex_rollover_settings
+
+        result = json.loads(
+            await update_flex_rollover_settings(
+                rollover_start_month="2026-08-01", rollover_starting_balance=0
+            )
+        )
+
+        assert result["success"] is False
+        assert "update_flex_rollover_settings" in result["error"]
+
+    async def test_handles_api_error(self, mock_monarch_client):
+        mock_monarch_client.update_flex_rollover_settings.side_effect = Exception(
+            "boom"
+        )
+
+        result = json.loads(
+            await update_flex_rollover_settings(
+                rollover_start_month="2026-08-01", rollover_starting_balance=0
+            )
+        )
+
+        assert result["error"] is True
+        assert result["tool"] == "update_flex_rollover_settings"
