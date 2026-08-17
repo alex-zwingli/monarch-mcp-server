@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from gql.transport.exceptions import TransportQueryError, TransportServerError
 
 from monarch_mcp_server.tools import budgets as budgets_module
 from monarch_mcp_server.tools.budgets import get_budgets, set_flexible_budget
@@ -54,14 +55,24 @@ def with_flex(base_response):
     return enriched
 
 
+def monarch_rejection():
+    """The error Monarch actually returns for a refused field.
+
+    Deliberately *not* standard GraphQL wording ("Cannot query field ..."):
+    Monarch answers with a generic message, so detection keys on the exception
+    type rather than the text. Using the real shape here keeps the test honest.
+    """
+    return TransportQueryError(
+        {"message": "Something went wrong while processing: None on request_id: None."}
+    )
+
+
 def reject_flex_only(base_response):
     """side_effect that rejects the flex query but serves the narrow one."""
 
     def _side_effect(*args, **kwargs):
         if kwargs.get("operation") == "MCPBudgetDataFlex":
-            raise Exception(
-                "Cannot query field 'monthlyAmountsForFlexExpense' on type 'BudgetData'."
-            )
+            raise monarch_rejection()
         return base_response
 
     return _side_effect
@@ -187,8 +198,8 @@ class TestFlexBucket:
     async def test_auth_error_propagates_and_does_not_disable_flex(
         self, mock_monarch_client
     ):
-        mock_monarch_client.gql_call.side_effect = Exception(
-            "401 Unauthorized: session expired"
+        mock_monarch_client.gql_call.side_effect = TransportServerError(
+            "401 Unauthorized", code=401
         )
 
         result = json.loads(await get_budgets())
@@ -199,20 +210,39 @@ class TestFlexBucket:
         # A transport/auth failure must not latch flex off for the process.
         assert budgets_module._flex_supported is None
 
+    async def test_does_not_latch_when_the_fallback_also_fails(
+        self, mock_monarch_client
+    ):
+        # An expired session refuses BOTH queries. That is not evidence the
+        # account lacks flex, so flex must stay un-probed for the next attempt.
+        mock_monarch_client.gql_call.side_effect = monarch_rejection()
+
+        result = json.loads(await get_budgets())
+
+        assert result["error"] is True
+        assert budgets_module._flex_supported is None
+
     @pytest.mark.parametrize(
-        "message,expected",
+        "exc,expected",
         [
-            ("Cannot query field 'totalsByMonth'", True),
-            ("Unknown field monthlyAmountsForFlexExpense", True),
-            ("401 Unauthorized", False),
-            ("Connection reset by peer", False),
-            ("", False),
+            # What Monarch really sends -- no GraphQL validation wording at all.
+            (
+                TransportQueryError(
+                    {"message": "Something went wrong while processing: None"}
+                ),
+                True,
+            ),
+            # Other transports that do use standard wording still match.
+            (Exception("Cannot query field 'totalsByMonth'"), True),
+            (Exception("Unknown field monthlyAmountsForFlexExpense"), True),
+            # Transport-level failures must not be read as "no flex bucket".
+            (TransportServerError("401 Unauthorized", code=401), False),
+            (Exception("Connection reset by peer"), False),
+            (Exception(""), False),
         ],
     )
-    def test_schema_rejection_detection(self, message, expected):
-        assert (
-            budgets_module._is_schema_rejection(Exception(message)) is expected
-        )
+    def test_query_rejection_detection(self, exc, expected):
+        assert budgets_module._is_query_rejection(exc) is expected
 
 
 class TestSetFlexibleBudget:

@@ -8,6 +8,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from gql import gql
 from monarchmoney import MonarchMoney
 
+try:  # gql raises this when the server answers but refuses the query itself.
+    from gql.transport.exceptions import TransportQueryError
+except ImportError:  # pragma: no cover - defensive, gql always ships it today
+    TransportQueryError = ()
+
 from monarch_mcp_server.app import mcp
 from monarch_mcp_server.client import get_monarch_client
 from monarch_mcp_server.helpers import json_success, json_error
@@ -18,9 +23,12 @@ logger = logging.getLogger(__name__)
 # budgetVariability/rolloverPeriod) that Monarch's current API rejects for some
 # accounts, so it can fail outright. This narrower query asks only for fields
 # the current API still returns.
-BUDGET_QUERY = gql(
-    """
-    query MCPBudgetData($startDate: Date!, $endDate: Date!) {
+#
+# Both documents below render from this one template, so the categoryGroups
+# selection is *structurally* identical between them -- adding flex support
+# cannot widen it by accident.
+_BUDGET_DOCUMENT = """
+    query %(operation)s($startDate: Date!, $endDate: Date!) {
       budgetData(startMonth: $startDate, endMonth: $endDate) {
         monthlyAmountsByCategory {
           category {
@@ -36,7 +44,7 @@ BUDGET_QUERY = gql(
             __typename
           }
           __typename
-        }
+        }%(flex_selections)s
         __typename
       }
       categoryGroups {
@@ -51,42 +59,17 @@ BUDGET_QUERY = gql(
         __typename
       }
     }
-    """
-)
+"""
 
-# BUDGET_QUERY plus the bucket-level amounts Monarch exposes for the
-# "fixed_and_flex" budget system. Under that system the Flexible section carries
-# a single amount covering every category beneath it; without these selections
-# that number is invisible and spending-vs-budget for Flexible cannot be
-# computed (see issue #103).
+# Bucket-level amounts Monarch exposes for the "fixed_and_flex" budget system.
+# Under that system the Flexible section carries a single amount covering every
+# category beneath it; without these selections that number is invisible and
+# spending-vs-budget for Flexible cannot be computed (issue #103).
 #
-# Kept as a separate document, rather than folded into BUDGET_QUERY, so that any
-# account whose API rejects these fields can fall back to the narrow query with
-# its behavior completely unchanged.
-#
-# Note: `budgetVariability` appears below under monthlyAmountsForFlexExpense.
-# That is a *different* subtree from the categoryGroups.budgetVariability field
-# implicated in the original failure -- the categoryGroups selection here stays
-# exactly as narrow as it is in BUDGET_QUERY.
-BUDGET_QUERY_FLEX = gql(
-    """
-    query MCPBudgetDataFlex($startDate: Date!, $endDate: Date!) {
-      budgetData(startMonth: $startDate, endMonth: $endDate) {
-        monthlyAmountsByCategory {
-          category {
-            id
-            __typename
-          }
-          monthlyAmounts {
-            month
-            plannedCashFlowAmount
-            plannedSetAsideAmount
-            actualAmount
-            remainingAmount
-            __typename
-          }
-          __typename
-        }
+# Note: `budgetVariability` appears here under monthlyAmountsForFlexExpense,
+# a *different* subtree from the categoryGroups.budgetVariability field
+# implicated in the original failure.
+_FLEX_SELECTIONS = """
         monthlyAmountsForFlexExpense {
           budgetVariability
           monthlyAmounts {
@@ -124,22 +107,16 @@ BUDGET_QUERY_FLEX = gql(
             __typename
           }
           __typename
-        }
-        __typename
-      }
-      categoryGroups {
-        id
-        name
-        type
-        categories {
-          id
-          name
-          __typename
-        }
-        __typename
-      }
-    }
-    """
+        }"""
+
+BUDGET_QUERY = gql(
+    _BUDGET_DOCUMENT % {"operation": "MCPBudgetData", "flex_selections": ""}
+)
+
+# Tried first; falls back to BUDGET_QUERY when Monarch refuses these fields.
+BUDGET_QUERY_FLEX = gql(
+    _BUDGET_DOCUMENT
+    % {"operation": "MCPBudgetDataFlex", "flex_selections": _FLEX_SELECTIONS}
 )
 
 # Cached for the life of the process: None = not yet probed, True = the flex
@@ -147,9 +124,10 @@ BUDGET_QUERY_FLEX = gql(
 # round-trip again.
 _flex_supported: Optional[bool] = None
 
-# Substrings that mark a GraphQL *validation* failure -- i.e. the server saying
-# these fields don't exist -- as opposed to a transport, auth or rate-limit
-# error that happens to occur on the same call.
+# Supplementary text match. Monarch does not return standard GraphQL validation
+# wording -- a rejected field comes back as a generic "Something went wrong
+# while processing" -- so exception *type* is the primary signal and these are
+# only a backstop for transports that do surface the usual messages.
 _SCHEMA_REJECTION_MARKERS = (
     "cannot query field",
     "unknown field",
@@ -157,7 +135,6 @@ _SCHEMA_REJECTION_MARKERS = (
     "unknown argument",
     "did you mean",
     "validation error",
-    "graphqlerror",
 )
 
 
@@ -167,14 +144,16 @@ def reset_flex_support() -> None:
     _flex_supported = None
 
 
-def _is_schema_rejection(exc: Exception) -> bool:
-    """True when *exc* looks like Monarch rejecting the flex fields themselves.
+def _is_query_rejection(exc: Exception) -> bool:
+    """True when the server answered but refused the query itself.
 
-    Only a schema rejection is cached as "flex unsupported". A 401, timeout or
-    connection reset must not permanently latch flex off for the process, and
-    must not be quietly downgraded into a successful-but-incomplete response --
-    those propagate to the caller instead.
+    ``TransportQueryError`` is what gql raises when a response carries GraphQL
+    ``errors``; HTTP failures (401, 5xx) raise ``TransportServerError`` and
+    connection problems raise their own types, so those fall through to the
+    caller rather than being mistaken for "this account has no flex bucket".
     """
+    if TransportQueryError and isinstance(exc, TransportQueryError):
+        return True
     text = str(exc).lower()
     return any(marker in text for marker in _SCHEMA_REJECTION_MARKERS)
 
@@ -205,6 +184,8 @@ async def get_budget_data(
         "endDate": end_date or default_end,
     }
 
+    rejection: Optional[Exception] = None
+
     if _flex_supported is not False:
         try:
             data = await client.gql_call(
@@ -215,20 +196,28 @@ async def get_budget_data(
             _flex_supported = True
             return data, True
         except Exception as exc:
-            if not _is_schema_rejection(exc):
+            if not _is_query_rejection(exc):
                 raise
-            logger.warning(
-                "Monarch rejected the flex budget fields; falling back to the "
-                "narrow budget query for the rest of this process: %s",
-                exc,
-            )
-            _flex_supported = False
+            rejection = exc
 
+    # Retry narrow. Note the latch is only set *after* this succeeds: if the
+    # fallback fails too, the problem was never flex-specific (an expired
+    # session refuses both queries), so it propagates and flex stays un-probed
+    # rather than being disabled for the rest of the process.
     data = await client.gql_call(
         operation="MCPBudgetData",
         graphql_query=BUDGET_QUERY,
         variables=variables,
     )
+
+    if rejection is not None:
+        logger.warning(
+            "Monarch rejected the flex budget fields; using the narrow budget "
+            "query for the rest of this process: %s",
+            rejection,
+        )
+        _flex_supported = False
+
     return data, False
 
 
