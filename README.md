@@ -323,7 +323,7 @@ Use get_budgets to show my current budget status
 **Two things that will produce wrong numbers if ignored:**
 
 1. **Income and expense amounts are both positive magnitudes.** The sign does not distinguish them — negatives appear only for contra entries. Summing `planned` across all `data` rows adds income to spending. Filter on `category_type` (`income` / `expense` / `transfer`) first.
-2. **Under flex budgeting most category rows carry no standalone budget.** Rows whose `budget_variability` is `flexible` are pooled into the single Flexible bucket, so their individual `planned` values are typically 0 and the real number lives in `flex`. On a representative account 57 of 86 rows were pooled this way; summing the rows gave `7,901` against a true planned expense total of `11,885`.
+2. **Under flex budgeting most category rows carry no standalone budget.** Rows whose `budget_variability` is `flexible` are pooled into the single Flexible bucket, so their individual `planned` values are typically 0 and the real number lives in `flex`. On a flex-budgeting account the majority of rows are usually pooled this way, so adding up the category rows understates planned spending by the whole size of the Flexible bucket. Compare against `totals[].expenses` rather than trusting a row sum.
 
 `flex.status` is one of:
 
@@ -357,7 +357,7 @@ Goal contributions are a **separate** quantity from a category's `set_aside`; ad
 
 ### Set the Flexible Bucket Amount
 ```
-Set my flexible budget to $4,000 for this month using set_flexible_budget
+Set my flexible budget to $1,500 for this month using set_flexible_budget
 ```
 
 ### Set a Budget Amount
