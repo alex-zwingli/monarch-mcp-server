@@ -29,9 +29,11 @@ def test_budget_query_avoids_stale_category_group_fields():
 def test_flex_query_keeps_category_groups_narrow():
     text = query_text(BUDGET_QUERY_FLEX)
 
-    # The flex query adds bucket-level fields under budgetData...
+    # The flex query adds roll-up fields under budgetData...
     assert "monthlyAmountsForFlexExpense" in text
+    assert "monthlyAmountsByCategoryGroup" in text
     assert "totalsByMonth" in text
+    assert "totalIncome" in text
 
     # ...but must not reintroduce the categoryGroups fields Monarch rejects.
     # budgetVariability legitimately appears under monthlyAmountsForFlexExpense,
@@ -189,6 +191,8 @@ class TestFormatBudgetTotals:
         assert format_budget_totals(raw, used_flex_query=True) == [
             {
                 "month": "2026-06-01",
+                "income": None,
+                "expenses": None,
                 "flexible": {
                     "planned": 1,
                     "actual": 2,

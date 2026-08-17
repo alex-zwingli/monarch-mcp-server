@@ -61,15 +61,23 @@ _BUDGET_DOCUMENT = """
     }
 """
 
-# Bucket-level amounts Monarch exposes for the "fixed_and_flex" budget system.
-# Under that system the Flexible section carries a single amount covering every
-# category beneath it; without these selections that number is invisible and
-# spending-vs-budget for Flexible cannot be computed (issue #103).
+# Roll-up amounts Monarch exposes above the per-category level. All live under
+# budgetData, so requesting them never widens the categoryGroups selection.
+#
+# - monthlyAmountsForFlexExpense: under the "fixed_and_flex" system the Flexible
+#   section carries a single amount covering every category beneath it. Flexible
+#   is the only *pooled* bucket -- Fixed and Non-Monthly are budgeted per
+#   category, so their numbers are sums and appear in totalsByMonth (issue #103).
+# - monthlyAmountsByCategoryGroup: group-level amounts, for groups budgeted at
+#   the group level rather than per category.
+# - totalsByMonth: income and overall expense totals alongside the three
+#   expense buckets.
 #
 # Note: `budgetVariability` appears here under monthlyAmountsForFlexExpense,
 # a *different* subtree from the categoryGroups.budgetVariability field
-# implicated in the original failure.
-_FLEX_SELECTIONS = """
+# implicated in the original failure. groupLevelBudgetingEnabled is
+# deliberately NOT requested -- it lives on categoryGroups, which stays narrow.
+_EXTENDED_SELECTIONS = """
         monthlyAmountsForFlexExpense {
           budgetVariability
           monthlyAmounts {
@@ -83,8 +91,38 @@ _FLEX_SELECTIONS = """
           }
           __typename
         }
+        monthlyAmountsByCategoryGroup {
+          categoryGroup {
+            id
+            __typename
+          }
+          monthlyAmounts {
+            month
+            plannedCashFlowAmount
+            actualAmount
+            remainingAmount
+            previousMonthRolloverAmount
+            rolloverType
+            __typename
+          }
+          __typename
+        }
         totalsByMonth {
           month
+          totalIncome {
+            plannedAmount
+            actualAmount
+            remainingAmount
+            previousMonthRolloverAmount
+            __typename
+          }
+          totalExpenses {
+            plannedAmount
+            actualAmount
+            remainingAmount
+            previousMonthRolloverAmount
+            __typename
+          }
           totalFlexibleExpenses {
             plannedAmount
             actualAmount
@@ -116,7 +154,7 @@ BUDGET_QUERY = gql(
 # Tried first; falls back to BUDGET_QUERY when Monarch refuses these fields.
 BUDGET_QUERY_FLEX = gql(
     _BUDGET_DOCUMENT
-    % {"operation": "MCPBudgetDataFlex", "flex_selections": _FLEX_SELECTIONS}
+    % {"operation": "MCPBudgetDataFlex", "flex_selections": _EXTENDED_SELECTIONS}
 )
 
 # Cached for the life of the process: None = not yet probed, True = the flex
@@ -335,6 +373,8 @@ def format_budget_totals(
     return [
         {
             "month": total.get("month"),
+            "income": _totals_entry(total.get("totalIncome")),
+            "expenses": _totals_entry(total.get("totalExpenses")),
             "flexible": _totals_entry(total.get("totalFlexibleExpenses")),
             "fixed": _totals_entry(total.get("totalFixedExpenses")),
             "non_monthly": _totals_entry(total.get("totalNonMonthlyExpenses")),
@@ -342,6 +382,52 @@ def format_budget_totals(
         for total in totals
         if total
     ]
+
+
+def format_group_budgets(
+    budget_data: Dict[str, Any], used_flex_query: bool
+) -> Optional[List[Dict[str, Any]]]:
+    """One row per category group per month, or None when unavailable.
+
+    Groups budgeted at the group level rather than per category hold their
+    amount here; for every other group this is the roll-up of its categories.
+    """
+    if not used_flex_query:
+        return None
+
+    by_group = (budget_data.get("budgetData") or {}).get(
+        "monthlyAmountsByCategoryGroup"
+    )
+    if not by_group:
+        return None
+
+    group_names: Dict[str, Optional[str]] = {
+        group.get("id"): group.get("name")
+        for group in budget_data.get("categoryGroups") or []
+        if group.get("id")
+    }
+
+    rows: List[Dict[str, Any]] = []
+    for entry in by_group:
+        if not entry:
+            continue
+        group_id = (entry.get("categoryGroup") or {}).get("id")
+        for amount in entry.get("monthlyAmounts") or []:
+            if not amount:
+                continue
+            rows.append(
+                {
+                    "id": group_id,
+                    "name": group_names.get(group_id),
+                    "planned": amount.get("plannedCashFlowAmount"),
+                    "actual": amount.get("actualAmount"),
+                    "remaining": amount.get("remainingAmount"),
+                    "rollover": amount.get("previousMonthRolloverAmount"),
+                    "month": amount.get("month"),
+                }
+            )
+
+    return rows
 
 
 @mcp.tool()
@@ -370,9 +456,17 @@ async def get_budgets(
         category in the Flexible section, so this -- not the per-category rows
         -- is the number to compare spending against. A ``status`` other than
         ``ok`` means no amount is available; do NOT treat that as zero.
+        Flexible is the only pooled bucket: Fixed and Non-Monthly are budgeted
+        per category, so their per-category rows in ``data`` are complete.
 
-        ``totals`` - per-month ``flexible`` / ``fixed`` / ``non_monthly``
-        totals, or null when this account does not expose them.
+        ``groups`` - one row per category group per month (``id``, ``name``,
+        ``planned``, ``actual``, ``remaining``, ``rollover``, ``month``), or
+        null when unavailable. Groups budgeted at the group level rather than
+        per category hold their amount here.
+
+        ``totals`` - per-month ``income``, ``expenses``, ``flexible``,
+        ``fixed`` and ``non_monthly`` totals, or null when this account does
+        not expose them.
     """
     try:
         client = await get_monarch_client()
@@ -383,6 +477,7 @@ async def get_budgets(
                 "args": {"start_date": start_date, "end_date": end_date},
                 "data": format_budget_data(raw),
                 "flex": format_flex_budget(raw, used_flex_query),
+                "groups": format_group_budgets(raw, used_flex_query),
                 "totals": format_budget_totals(raw, used_flex_query),
             }
         )

@@ -22,9 +22,37 @@ FLEX_BLOCK = {
     ],
 }
 
+GROUPS_BLOCK = [
+    {
+        "categoryGroup": {"id": "grp-1"},
+        "monthlyAmounts": [
+            {
+                "month": "2026-03-01",
+                "plannedCashFlowAmount": 700.00,
+                "actualAmount": 505.00,
+                "remainingAmount": 195.00,
+                "previousMonthRolloverAmount": 0.00,
+                "rolloverType": "monthly",
+            }
+        ],
+    }
+]
+
 TOTALS_BLOCK = [
     {
         "month": "2026-03-01",
+        "totalIncome": {
+            "plannedAmount": 8000.00,
+            "actualAmount": 8000.00,
+            "remainingAmount": 0.00,
+            "previousMonthRolloverAmount": 0.00,
+        },
+        "totalExpenses": {
+            "plannedAmount": 3800.00,
+            "actualAmount": 2850.00,
+            "remainingAmount": 950.00,
+            "previousMonthRolloverAmount": 0.00,
+        },
         "totalFlexibleExpenses": {
             "plannedAmount": 2000.00,
             "actualAmount": 1250.00,
@@ -51,6 +79,7 @@ def with_flex(base_response):
     """Copy the default fixture response, adding flex + totals selections."""
     enriched = json.loads(json.dumps(base_response))
     enriched["budgetData"]["monthlyAmountsForFlexExpense"] = FLEX_BLOCK
+    enriched["budgetData"]["monthlyAmountsByCategoryGroup"] = GROUPS_BLOCK
     enriched["budgetData"]["totalsByMonth"] = TOTALS_BLOCK
     return enriched
 
@@ -143,6 +172,46 @@ class TestFlexBucket:
         assert result["totals"][0]["fixed"]["remaining"] == 0.00
         assert result["totals"][0]["non_monthly"]["actual"] == 100.00
 
+    async def test_reports_income_and_overall_expense_totals(
+        self, mock_monarch_client
+    ):
+        mock_monarch_client.gql_call.return_value = with_flex(
+            mock_monarch_client.gql_call.return_value
+        )
+
+        totals = json.loads(await get_budgets())["totals"][0]
+
+        assert totals["income"] == {
+            "planned": 8000.00,
+            "actual": 8000.00,
+            "remaining": 0.00,
+            "rollover": 0.00,
+        }
+        assert totals["expenses"]["planned"] == 3800.00
+
+    async def test_reports_group_level_budgets(self, mock_monarch_client):
+        mock_monarch_client.gql_call.return_value = with_flex(
+            mock_monarch_client.gql_call.return_value
+        )
+
+        groups = json.loads(await get_budgets())["groups"]
+
+        assert groups == [
+            {
+                "id": "grp-1",
+                "name": "Food",
+                "planned": 700.00,
+                "actual": 505.00,
+                "remaining": 195.00,
+                "rollover": 0.00,
+                "month": "2026-03-01",
+            }
+        ]
+
+    async def test_groups_null_when_unavailable(self):
+        # Default fixture omits the group selection entirely.
+        assert json.loads(await get_budgets())["groups"] is None
+
     async def test_prefers_the_flex_query(self, mock_monarch_client):
         await get_budgets()
         _, kwargs = mock_monarch_client.gql_call.call_args
@@ -167,6 +236,7 @@ class TestFlexBucket:
 
         assert result["flex"]["status"] == "unsupported"
         assert result["totals"] is None
+        assert result["groups"] is None
         # The whole tool still works -- this is the no-regression guarantee.
         assert len(result["data"]) == 2
         operations = [
