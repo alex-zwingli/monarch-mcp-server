@@ -230,7 +230,7 @@ Once authenticated, use these tools directly in Claude Desktop or Claude Code:
 - **Split Transaction**: Divide a single transaction into multiple parts with different categories or merchants
 
 ### 💵 Budget Management
-- **Get Budgets**: Access budget information including spent amounts and remaining balances by category, plus the all-up **Flexible** bucket and per-month fixed/flexible/non-monthly totals
+- **Get Budgets**: Budget information by category (including rollover and set-aside), the all-up **Flexible** bucket, category-group roll-ups, savings-goal contributions, the account's budget system, and per-month income / expense / fixed / flexible / non-monthly totals
 - **Set Budget Amount**: Create or modify budget amounts for any category or category group
 - **Set Flexible Budget**: Set the bucket-level Flexible amount used by Monarch's "fixed_and_flex" budget system
 - **Update Flex Rollover Settings**: Start a fresh Flex rollover period, for buckets that have accumulated a large negative rollover
@@ -261,7 +261,7 @@ Once authenticated, use these tools directly in Claude Desktop or Claude Code:
 | `check_auth_status` | Check authentication status | None |
 | `get_accounts` | Get all financial accounts | None |
 | `get_transactions` | Get transactions with filtering and reconciliation fields | `limit`, `offset`, `start_date`, `end_date`, `account_id`, `account_ids`, `category_ids`, `category_group_ids`, `tag_ids`, `search`, `wide_search`, `search_scan_limit`, `has_notes`, `is_split`, `is_recurring` |
-| `get_budgets` | Get budget information, including the Flexible bucket | `start_date`, `end_date` |
+| `get_budgets` | Get budget information, including the Flexible bucket | `start_date`, `end_date` (pass both or neither) |
 | `set_budget_amount` | Set budget for a category | `amount`, `category_id`, `category_group_id`, `start_date`, `apply_to_future` |
 | `set_flexible_budget` | Set the all-up Flexible bucket amount | `amount`, `start_date`, `apply_to_future` |
 | `update_flex_rollover_settings` | Start a new Flex rollover period (**discards accumulated rollover**) | `rollover_start_month`, `rollover_starting_balance`, `rollover_enabled` |
@@ -331,11 +331,29 @@ Use get_budgets to show my current budget status
 - `not_configured` — the account has no Flexible bucket (e.g. it is not on flex budgeting)
 - `unsupported` — Monarch rejected the extended fields, so the narrower fallback query ran
 
-A status other than `ok` means **no amount is available — it does not mean zero**. When it is `unsupported`, `groups`, `goals`, `totals`, `budget_system` and each row's `rollover` / `budget_variability` are all `null` for the same reason.
+A status other than `ok` means **no amount is available — it does not mean zero**. When it is `unsupported`, `groups`, `goals`, `totals`, `budget_system` and each row's `rollover` / `rollover_type` / `budget_variability` are all `null` for the same reason.
 
 For `groups`, `goals` and `totals`, `null` means "could not be fetched" while `[]` means "asked, and there were none".
 
-Per-row, `planned - actual` equals `remaining` only when `rollover` is zero; for rollover categories the carried balance accounts for the difference. In `groups`, add a group's `planned` to its categories' totals only when `group_level_budgeting` is false — when true the group holds the budget itself.
+Per-row, `planned - actual` equals `remaining` only when `rollover` is zero; for rollover categories the carried balance accounts for the difference.
+
+**Never add a group's `planned` to its categories' `planned`** — that double-counts either way. `group_level_budgeting` tells you which level holds the real budget: when `true` the group does and its categories carry none; when `false` the group row is only the roll-up of those same categories.
+
+Full response shape:
+
+| Key | Contents |
+|---|---|
+| `tool`, `args` | echo of the call |
+| `budget_system` | e.g. `"fixed_and_flex"`, or `null` |
+| `data[]` | `id`, `name`, `planned`, `actual`, `remaining`, `set_aside`, `rollover`, `rollover_type`, `category_group`, `category_type`, `budget_variability`, `month` |
+| `flex` | `status`, `budget_variability`, `monthly[]` (`month`, `planned`, `actual`, `remaining`, `rollover`, `rollover_type`) |
+| `groups[]` | `id`, `name`, `planned`, `actual`, `remaining`, `rollover`, `rollover_type`, `category_type`, `group_level_budgeting`, `month` |
+| `goals[]` | `id`, `name`, `priority`, `archived`, `completed`, `planned_contributions[]`, `actual_contributions[]` |
+| `totals[]` | `month`, plus `income` / `expenses` / `flexible` / `fixed` / `non_monthly`, each `planned`, `actual`, `remaining`, `rollover` |
+
+Goal contributions are a **separate** quantity from a category's `set_aside`; adding them together double-counts.
+
+`start_date` and `end_date` must be passed **together or not at all** — supplying only one is rejected rather than filled in, because completing the missing side from today can invert the range and return an empty result that reads as "no budget".
 
 ### Set the Flexible Bucket Amount
 ```

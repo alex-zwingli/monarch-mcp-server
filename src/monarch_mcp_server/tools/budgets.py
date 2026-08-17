@@ -24,9 +24,10 @@ logger = logging.getLogger(__name__)
 # accounts, so it can fail outright. This narrower query asks only for fields
 # the current API still returns.
 #
-# Both documents below render from this one template, so the categoryGroups
-# selection is *structurally* identical between them -- adding flex support
-# cannot widen it by accident.
+# Both documents below render from this one template. The narrow document
+# supplies "" for every extension slot, so it is exactly the selection already
+# proven to work; anything added to categoryGroups must go through a slot and
+# therefore lands in the extended document only, where the fallback covers it.
 _BUDGET_DOCUMENT = """
     query %(operation)s($startDate: Date!, $endDate: Date!) {
       budgetData(startMonth: $startDate, endMonth: $endDate) {
@@ -135,9 +136,10 @@ _ROOT_EXTRA = """
 #   expense buckets.
 #
 # Note: `budgetVariability` appears here under monthlyAmountsForFlexExpense,
-# a *different* subtree from the categoryGroups.budgetVariability field
-# implicated in the original failure. groupLevelBudgetingEnabled is
-# deliberately NOT requested -- it lives on categoryGroups, which stays narrow.
+# a *different* subtree from the CategoryGroup.budgetVariability field
+# implicated in the original failure -- that one stays out of both documents,
+# as does rolloverPeriod. See _GROUP_EXTRA / _CATEGORY_FIELD_EXTRA for what the
+# extended document does add to the categoryGroups subtree.
 _EXTENDED_SELECTIONS = """
         monthlyAmountsForFlexExpense {
           budgetVariability
@@ -445,15 +447,25 @@ def format_flex_budget(
     else:
         entries = []
 
-    # If Monarch ever returns several buckets here, take the flexible one
-    # rather than merging them: concatenating a fixed bucket's months into the
-    # flex answer under whichever label happened to come last would report a
-    # different bucket's amount as the flexible budget.
-    flexible_entries = [
-        e for e in entries if e and e.get("budgetVariability") == "flexible"
-    ]
-    if flexible_entries:
-        entries = flexible_entries
+    # If Monarch ever returns several buckets here, never merge them:
+    # concatenating a fixed bucket's months into the flex answer under
+    # whichever label came last would report a different bucket's amount as the
+    # flexible budget. Prefer the entry actually labelled flexible; failing
+    # that, take a single entry rather than combining ambiguous ones.
+    if len(entries) > 1:
+        flexible_entries = [
+            e for e in entries if e and e.get("budgetVariability") == "flexible"
+        ]
+        if len(flexible_entries) == 1:
+            entries = flexible_entries
+        else:
+            logger.warning(
+                "Monarch returned %d flex-expense buckets (%d labelled "
+                "flexible); using only the first to avoid merging buckets.",
+                len(entries),
+                len(flexible_entries),
+            )
+            entries = (flexible_entries or entries)[:1]
 
     variability: Optional[str] = None
     monthly: List[Dict[str, Any]] = []
@@ -619,8 +631,13 @@ async def get_budgets(
     Get budget information from Monarch Money.
 
     Args:
-        start_date: Start month in YYYY-MM-DD format (defaults to the current month)
-        end_date: End month in YYYY-MM-DD format (defaults to the current month)
+        start_date: Start month in YYYY-MM-DD format
+        end_date: End month in YYYY-MM-DD format
+
+        Pass BOTH or NEITHER. Omitting both defaults to the current month;
+        supplying only one is an error rather than being filled in, because
+        completing the missing side from today can invert the range and return
+        an empty result that reads as "this account has no budget".
 
     Returns:
         A JSON object as described below.
@@ -663,10 +680,11 @@ async def get_budgets(
         ``groups`` - one row per category group per month (``id``, ``name``,
         ``planned``, ``actual``, ``remaining``, ``rollover``,
         ``rollover_type``, ``category_type``, ``group_level_budgeting``,
-        ``month``). Add a group's ``planned`` to its categories' only when
-        ``group_level_budgeting`` is false would double-count -- when it is
-        true the group holds the budget, otherwise the row is a roll-up of
-        those same categories.
+        ``month``). ``group_level_budgeting`` says which level holds the real
+        budget: when true the group does and its categories carry none; when
+        false this row is only the roll-up of its own categories. Never add a
+        group's ``planned`` to its categories' ``planned`` -- that
+        double-counts either way.
 
         ``goals`` - savings goals with ``planned_contributions`` and
         ``actual_contributions`` per month. Goal contributions are a SEPARATE
@@ -919,10 +937,15 @@ async def update_flex_rollover_settings(
             })
 
         if budget_system != "fixed_and_flex":
+            described = (
+                repr(budget_system)
+                if budget_system
+                else "not reported by Monarch"
+            )
             return json_success({
                 "success": False,
                 "error": (
-                    f"This account's budget system is {budget_system!r}, not "
+                    f"This account's budget system is {described}, not "
                     "'fixed_and_flex'. Refusing: this mutation would rewrite "
                     "the account's budget system as well as the rollover."
                 ),
@@ -935,6 +958,28 @@ async def update_flex_rollover_settings(
             rollover_enabled=rollover_enabled,
             budget_system=budget_system,
         )
+
+        # Same reasoning as set_flexible_budget, and it matters more here:
+        # falsely confirming a destructive reset is worse than falsely
+        # confirming an amount.
+        period = (
+            ((result or {}).get("updateBudgetSettings") or {}).get(
+                "budgetRolloverPeriod"
+            )
+            if isinstance(result, dict)
+            else None
+        )
+        if not period:
+            return json_success({
+                "success": False,
+                "error": (
+                    "Monarch did not confirm the change -- the response "
+                    "contained no rollover period. The reset may not have "
+                    "been applied; re-read it with get_budgets before "
+                    "retrying."
+                ),
+                "result": result,
+            })
 
         return json_success({
             "success": True,

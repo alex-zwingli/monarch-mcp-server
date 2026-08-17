@@ -172,13 +172,36 @@ class TestGetBudgets:
         assert result["tool"] == "get_budgets"
         assert "data" not in result
 
-    async def test_rejects_a_half_specified_date_range(self):
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"start_date": "2026-12-01"}, {"end_date": "2026-03-31"}],
+    )
+    async def test_rejects_a_half_specified_date_range(
+        self, kwargs, mock_monarch_client
+    ):
         # Filling the missing side from the current month can invert the range,
         # which returns nothing and reads as "this account has no budget".
-        result = json.loads(await get_budgets(start_date="2026-12-01"))
+        # Both directions matter: either one can produce start > end.
+        result = json.loads(await get_budgets(**kwargs))
 
         assert result["error"] is True
         assert "together" in result["message"]
+        # Rejected before any request went out.
+        mock_monarch_client.gql_call.assert_not_awaited()
+
+    async def test_get_budget_data_raises_on_a_half_specified_range(
+        self, mock_monarch_client
+    ):
+        # Pin the helper's contract directly, not just the envelope the tool
+        # wraps it in -- and pin the exception type.
+        with pytest.raises(ValueError):
+            await budgets_module.get_budget_data(
+                mock_monarch_client, start_date="2026-12-01"
+            )
+        with pytest.raises(ValueError):
+            await budgets_module.get_budget_data(
+                mock_monarch_client, end_date="2026-12-31"
+            )
 
     async def test_survives_explicit_nulls_in_the_response(
         self, mock_monarch_client
@@ -362,6 +385,26 @@ class TestFlexBucket:
         # Archived goals are surfaced but flagged, not silently dropped.
         assert goals[1]["archived"] is True
 
+    async def test_flags_completed_goals(self, mock_monarch_client):
+        enriched = with_flex(mock_monarch_client.gql_call.return_value)
+        enriched["goalsV2"] = [
+            {
+                "id": "goal-3",
+                "name": "Car Fund",
+                "priority": 1,
+                "archivedAt": None,
+                "completedAt": "2026-02-01",
+                "plannedContributions": [],
+                "monthlyContributionSummaries": [],
+            }
+        ]
+        mock_monarch_client.gql_call.return_value = enriched
+
+        goal = json.loads(await get_budgets())["goals"][0]
+
+        assert goal["completed"] is True
+        assert goal["archived"] is False
+
     async def test_goals_empty_when_account_has_none(self):
         assert json.loads(await get_budgets())["goals"] == []
 
@@ -386,6 +429,37 @@ class TestFlexBucket:
         await get_budgets()
         _, kwargs = mock_monarch_client.gql_call.call_args
         assert kwargs["operation"] == "MCPBudgetDataFlex"
+
+    @staticmethod
+    def _assert_operation_matches_document(call):
+        """The operation name must be the one inside the document sent with it.
+
+        The client forwards `operation` as operation_name, so a mismatched pair
+        is rejected by the real server -- which _is_query_rejection reads as
+        "no flex here", permanently degrading every account. Checking each
+        document in isolation cannot catch a swap at the call site.
+        """
+        operation = call.kwargs["operation"]
+        document = call.kwargs["graphql_query"]
+        node = getattr(document, "document", document)
+        assert f"query {operation}(" in node.loc.source.body, (
+            f"operation {operation!r} was sent with a document that does not "
+            f"declare it"
+        )
+
+    async def test_each_call_pairs_its_operation_with_the_right_document(
+        self, mock_monarch_client
+    ):
+        base = mock_monarch_client.gql_call.return_value
+        mock_monarch_client.gql_call.side_effect = reject_flex_only(base)
+
+        # Exercises both the extended call and the narrow fallback.
+        await get_budgets()
+
+        calls = mock_monarch_client.gql_call.call_args_list
+        assert len(calls) == 2
+        for call in calls:
+            self._assert_operation_matches_document(call)
 
     async def test_not_configured_when_account_has_no_flex_bucket(self):
         # The default fixture response omits the flex selections entirely.

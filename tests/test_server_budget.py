@@ -206,6 +206,54 @@ class TestFormatFlexBudget:
         raw = {"budgetData": {"monthlyAmountsForFlexExpense": None}}
         assert format_flex_budget(raw, used_flex_query=True)["status"] == "not_configured"
 
+    def test_never_merges_multiple_buckets(self):
+        # Merging a fixed bucket's months into the flex answer would report a
+        # different bucket's amount as the flexible budget.
+        def bucket(variability, planned):
+            return {
+                "budgetVariability": variability,
+                "monthlyAmounts": [
+                    {"month": "2026-06-01", "plannedCashFlowAmount": planned}
+                ],
+            }
+
+        raw = {
+            "budgetData": {
+                "monthlyAmountsForFlexExpense": [
+                    bucket("fixed", 7000),
+                    bucket("flexible", 900),
+                ]
+            }
+        }
+
+        result = format_flex_budget(raw, used_flex_query=True)
+
+        assert result["budget_variability"] == "flexible"
+        assert [m["planned"] for m in result["monthly"]] == [900]
+
+    def test_falls_back_to_one_bucket_when_none_is_labelled_flexible(self):
+        # Ambiguous labelling must not collapse into a merged total either.
+        raw = {
+            "budgetData": {
+                "monthlyAmountsForFlexExpense": [
+                    {
+                        "monthlyAmounts": [
+                            {"month": "2026-06-01", "plannedCashFlowAmount": 100}
+                        ]
+                    },
+                    {
+                        "monthlyAmounts": [
+                            {"month": "2026-06-01", "plannedCashFlowAmount": 200}
+                        ]
+                    },
+                ]
+            }
+        }
+
+        result = format_flex_budget(raw, used_flex_query=True)
+
+        assert [m["planned"] for m in result["monthly"]] == [100]
+
     def test_accepts_a_bare_object_or_a_list(self):
         block = {
             "budgetVariability": "flexible",
