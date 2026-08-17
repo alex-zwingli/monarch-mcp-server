@@ -26,6 +26,22 @@ def test_budget_query_avoids_stale_category_group_fields():
     assert "rolloverPeriod" not in text
 
 
+def test_fallback_query_requests_nothing_beyond_the_proven_set():
+    # The narrow query is the safety net: it must stay exactly the document
+    # already known to work, so none of the extended fields may leak into it.
+    text = query_text(BUDGET_QUERY)
+
+    for field in (
+        "monthlyAmountsForFlexExpense",
+        "monthlyAmountsByCategoryGroup",
+        "totalsByMonth",
+        "previousMonthRolloverAmount",
+        "rolloverType",
+        "budgetSystem",
+    ):
+        assert field not in text, f"{field} leaked into the fallback query"
+
+
 def test_flex_query_keeps_category_groups_narrow():
     text = query_text(BUDGET_QUERY_FLEX)
 
@@ -76,6 +92,9 @@ def test_format_budget_data_returns_current_month_category_rows():
             "planned": -100,
             "actual": -25,
             "remaining": -75,
+            "set_aside": 0,
+            "rollover": None,
+            "rollover_type": None,
             "category_group": "Food",
             "month": "2026-06-01",
         }

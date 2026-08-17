@@ -120,6 +120,9 @@ class TestGetBudgets:
             "planned": 500.00,
             "actual": 320.00,
             "remaining": 180.00,
+            "set_aside": 0.00,
+            "rollover": None,
+            "rollover_type": None,
             "category_group": "Food",
             "month": "2026-03-01",
         }
@@ -211,6 +214,38 @@ class TestFlexBucket:
     async def test_groups_null_when_unavailable(self):
         # Default fixture omits the group selection entirely.
         assert json.loads(await get_budgets())["groups"] is None
+
+    async def test_surfaces_rollover_so_remaining_reconciles(
+        self, mock_monarch_client
+    ):
+        enriched = with_flex(mock_monarch_client.gql_call.return_value)
+        amounts = enriched["budgetData"]["monthlyAmountsByCategory"][0][
+            "monthlyAmounts"
+        ][0]
+        # A rollover category: planned - actual (180) != remaining (430).
+        amounts["remainingAmount"] = 430.00
+        amounts["previousMonthRolloverAmount"] = 250.00
+        amounts["rolloverType"] = "monthly"
+        mock_monarch_client.gql_call.return_value = enriched
+
+        row = next(
+            r for r in json.loads(await get_budgets())["data"] if r["id"] == "cat-1"
+        )
+
+        assert row["rollover"] == 250.00
+        assert row["rollover_type"] == "monthly"
+        # The gap is now explainable rather than looking like bad data.
+        assert row["planned"] - row["actual"] + row["rollover"] == row["remaining"]
+
+    async def test_reports_budget_system(self, mock_monarch_client):
+        enriched = with_flex(mock_monarch_client.gql_call.return_value)
+        enriched["budgetSystem"] = "fixed_and_flex"
+        mock_monarch_client.gql_call.return_value = enriched
+
+        assert json.loads(await get_budgets())["budget_system"] == "fixed_and_flex"
+
+    async def test_budget_system_null_when_absent(self):
+        assert json.loads(await get_budgets())["budget_system"] is None
 
     async def test_prefers_the_flex_query(self, mock_monarch_client):
         await get_budgets()

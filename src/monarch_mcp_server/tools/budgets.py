@@ -40,7 +40,7 @@ _BUDGET_DOCUMENT = """
             plannedCashFlowAmount
             plannedSetAsideAmount
             actualAmount
-            remainingAmount
+            remainingAmount%(category_extra)s
             __typename
           }
           __typename
@@ -57,9 +57,23 @@ _BUDGET_DOCUMENT = """
           __typename
         }
         __typename
-      }
+      }%(root_extra)s
     }
 """
+
+# Per-category rollover. Without these, planned - actual does not equal
+# remaining for any category with rollover enabled, and the difference is
+# unexplainable from the tool's output. Requested only by the extended query:
+# the fallback stays byte-for-byte the document already proven to work.
+_CATEGORY_EXTRA = """
+            previousMonthRolloverAmount
+            rolloverType"""
+
+# Which budget system the account uses ("fixed_and_flex" or otherwise). Lets a
+# caller tell "this account does not do flex budgeting" from "the flex bucket
+# is empty" without inferring it.
+_ROOT_EXTRA = """
+      budgetSystem"""
 
 # Roll-up amounts Monarch exposes above the per-category level. All live under
 # budgetData, so requesting them never widens the categoryGroups selection.
@@ -148,13 +162,24 @@ _EXTENDED_SELECTIONS = """
         }"""
 
 BUDGET_QUERY = gql(
-    _BUDGET_DOCUMENT % {"operation": "MCPBudgetData", "flex_selections": ""}
+    _BUDGET_DOCUMENT
+    % {
+        "operation": "MCPBudgetData",
+        "flex_selections": "",
+        "category_extra": "",
+        "root_extra": "",
+    }
 )
 
 # Tried first; falls back to BUDGET_QUERY when Monarch refuses these fields.
 BUDGET_QUERY_FLEX = gql(
     _BUDGET_DOCUMENT
-    % {"operation": "MCPBudgetDataFlex", "flex_selections": _EXTENDED_SELECTIONS}
+    % {
+        "operation": "MCPBudgetDataFlex",
+        "flex_selections": _EXTENDED_SELECTIONS,
+        "category_extra": _CATEGORY_EXTRA,
+        "root_extra": _ROOT_EXTRA,
+    }
 )
 
 # Cached for the life of the process: None = not yet probed, True = the flex
@@ -286,6 +311,11 @@ def format_budget_data(budget_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "planned": monthly_amount.get("plannedCashFlowAmount"),
                     "actual": monthly_amount.get("actualAmount"),
                     "remaining": monthly_amount.get("remainingAmount"),
+                    # planned - actual only equals remaining when rollover is
+                    # zero; without these the gap is unexplainable.
+                    "set_aside": monthly_amount.get("plannedSetAsideAmount"),
+                    "rollover": monthly_amount.get("previousMonthRolloverAmount"),
+                    "rollover_type": monthly_amount.get("rolloverType"),
                     "category_group": category_info.get("category_group"),
                     "month": monthly_amount.get("month"),
                 }
@@ -445,9 +475,17 @@ async def get_budgets(
     Returns:
         A JSON object with:
 
+        ``budget_system`` - e.g. "fixed_and_flex", or null on accounts that do
+        not report it. Use this to tell "this account does not do flex
+        budgeting" from "the flex bucket is empty".
+
         ``data`` - one row per budgeted category per month, each with ``id``
         (category id), ``name``, ``planned`` (planned cash-flow amount),
-        ``actual``, ``remaining``, ``category_group`` and ``month``.
+        ``actual``, ``remaining``, ``set_aside``, ``rollover``,
+        ``rollover_type``, ``category_group`` and ``month``. Note ``planned``
+        minus ``actual`` equals ``remaining`` only when ``rollover`` is zero --
+        for rollover categories the carried balance accounts for the
+        difference.
 
         ``flex`` - the all-up Flexible bucket for accounts on Monarch's
         "fixed_and_flex" budget system, with ``status`` (``ok``,
@@ -475,6 +513,7 @@ async def get_budgets(
             {
                 "tool": "get_budgets",
                 "args": {"start_date": start_date, "end_date": end_date},
+                "budget_system": raw.get("budgetSystem"),
                 "data": format_budget_data(raw),
                 "flex": format_flex_budget(raw, used_flex_query),
                 "groups": format_group_budgets(raw, used_flex_query),
