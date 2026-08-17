@@ -318,15 +318,24 @@ Show me my last 50 transactions using get_transactions with limit 50
 Use get_budgets to show my current budget status
 ```
 
-`get_budgets` returns a JSON object with `data` (one row per category per month), `flex`, and `totals`. On Monarch's "fixed_and_flex" budget system the Flexible section carries a **single amount covering every category beneath it**, and that number lives in `flex`, not in the per-category rows — comparing spending against the category rows alone will understate the Flexible budget.
+`get_budgets` returns a JSON object with `budget_system`, `data` (one row per category per month), `flex`, `groups`, `goals` and `totals`.
+
+**Two things that will produce wrong numbers if ignored:**
+
+1. **Income and expense amounts are both positive magnitudes.** The sign does not distinguish them — negatives appear only for contra entries. Summing `planned` across all `data` rows adds income to spending. Filter on `category_type` (`income` / `expense` / `transfer`) first.
+2. **Under flex budgeting most category rows carry no standalone budget.** Rows whose `budget_variability` is `flexible` are pooled into the single Flexible bucket, so their individual `planned` values are typically 0 and the real number lives in `flex`. On a representative account 57 of 86 rows were pooled this way; summing the rows gave `7,901` against a true planned expense total of `11,885`.
 
 `flex.status` is one of:
 
 - `ok` — a Flexible bucket amount was returned
 - `not_configured` — the account has no Flexible bucket (e.g. it is not on flex budgeting)
-- `unsupported` — Monarch rejected the flex fields, so the narrower fallback query ran
+- `unsupported` — Monarch rejected the extended fields, so the narrower fallback query ran
 
-A status other than `ok` means **no amount is available — it does not mean zero**. `totals` carries per-month `flexible` / `fixed` / `non_monthly` totals, or `null` when unavailable.
+A status other than `ok` means **no amount is available — it does not mean zero**. When it is `unsupported`, `groups`, `goals`, `totals`, `budget_system` and each row's `rollover` / `budget_variability` are all `null` for the same reason.
+
+For `groups`, `goals` and `totals`, `null` means "could not be fetched" while `[]` means "asked, and there were none".
+
+Per-row, `planned - actual` equals `remaining` only when `rollover` is zero; for rollover categories the carried balance accounts for the difference. In `groups`, add a group's `planned` to its categories' totals only when `group_level_budgeting` is false — when true the group holds the budget itself.
 
 ### Set the Flexible Bucket Amount
 ```
@@ -497,7 +506,9 @@ monarch-mcp-server/
 
 ### Recommended: require approval for mutating tools
 
-Several tools mutate your Monarch ledger (`create_transaction`, `update_transaction`, `delete_transaction`, `bulk_categorize_transactions`, `upload_account_balance_history`, `set_transaction_tags`, `create_transaction_rule`, `update_transaction_rule`, `delete_transaction_rule`, `split_transaction`, `set_budget_amount`, `set_flexible_budget`, `update_flex_rollover_settings`, `update_merchant`, `review_recurring_stream`).
+Several tools mutate your Monarch ledger (`create_transaction`, `update_transaction`, `delete_transaction`, `bulk_categorize_transactions`, `upload_account_balance_history`, `set_transaction_tags`, `create_transaction_rule`, `update_transaction_rule`, `delete_transaction_rule`, `split_transaction`, `set_budget_amount`, `set_flexible_budget`, `update_flex_rollover_settings`, `update_merchant`, `review_recurring_stream`, `categorize_transaction`, `update_transaction_notes`, `mark_transaction_reviewed`, `add_transaction_tag`, `create_transaction_tag`, `create_transaction_category`, `update_category`).
+
+Note `update_category` also carries rollover-reset arguments (`rollover_start_month`, `rollover_starting_balance`), so it can discard a category's accumulated rollover — see issue #107.
 
 `update_flex_rollover_settings` deserves particular care: it discards the Flex bucket's accumulated rollover balance and starts a fresh period. Its two destructive arguments are deliberately required rather than defaulted, so it cannot be invoked as a no-argument "reset", but it should still be approved manually every time.
 

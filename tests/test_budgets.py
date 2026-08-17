@@ -1,6 +1,8 @@
 """Tests for budget-related MCP tools."""
 
+import calendar
 import json
+from datetime import date
 
 import pytest
 from gql.transport.exceptions import TransportQueryError, TransportServerError
@@ -128,6 +130,8 @@ class TestGetBudgets:
             "rollover": None,
             "rollover_type": None,
             "category_group": "Food",
+            "category_type": "expense",
+            "budget_variability": None,
             "month": "2026-03-01",
         }
 
@@ -140,17 +144,63 @@ class TestGetBudgets:
         }
 
     async def test_defaults_to_current_month(self, mock_monarch_client):
-        from monarch_mcp_server.tools.budgets import current_month_range
-
-        start, end = current_month_range()
+        # Deliberately does NOT call current_month_range() to build the
+        # expectation -- that would restate the implementation. Pin the shape
+        # independently instead.
         await get_budgets()
         _, kwargs = mock_monarch_client.gql_call.call_args
-        assert kwargs["variables"] == {"startDate": start, "endDate": end}
+        start = kwargs["variables"]["startDate"]
+        end = kwargs["variables"]["endDate"]
+
+        today = date.today()
+        assert start == today.replace(day=1).isoformat()
+        assert start.endswith("-01")
+        last_day = calendar.monthrange(today.year, today.month)[1]
+        assert end == today.replace(day=last_day).isoformat()
+        assert start <= end
 
     async def test_handles_api_error(self, mock_monarch_client):
         mock_monarch_client.gql_call.side_effect = Exception("Budget error")
-        result = await get_budgets()
-        assert "get_budgets" in result
+
+        result = json.loads(await get_budgets())
+
+        # Must be a real error envelope. Asserting only `"get_budgets" in
+        # result` would also match the SUCCESS payload, which carries
+        # "tool": "get_budgets" -- so a regression rendering an outage as an
+        # empty-but-successful budget would pass.
+        assert result["error"] is True
+        assert result["tool"] == "get_budgets"
+        assert "data" not in result
+
+    async def test_rejects_a_half_specified_date_range(self):
+        # Filling the missing side from the current month can invert the range,
+        # which returns nothing and reads as "this account has no budget".
+        result = json.loads(await get_budgets(start_date="2026-12-01"))
+
+        assert result["error"] is True
+        assert "together" in result["message"]
+
+    async def test_survives_explicit_nulls_in_the_response(
+        self, mock_monarch_client
+    ):
+        # GraphQL returns explicit null for nullable fields; `.get(k, default)`
+        # does not catch that, and one such null used to take out the tool.
+        for response in (
+            {"budgetData": None, "categoryGroups": None},
+            {"budgetData": {"monthlyAmountsByCategory": None}, "categoryGroups": []},
+            {
+                "budgetData": {"monthlyAmountsByCategory": [None]},
+                "categoryGroups": [None],
+            },
+            {
+                "budgetData": {"monthlyAmountsByCategory": []},
+                "categoryGroups": [{"id": "g", "name": "G", "categories": None}],
+            },
+        ):
+            mock_monarch_client.gql_call.return_value = response
+            result = json.loads(await get_budgets())
+            assert result.get("error") is not True, response
+            assert result["data"] == []
 
 
 class TestFlexBucket:
@@ -211,13 +261,30 @@ class TestFlexBucket:
                 "actual": 505.00,
                 "remaining": 195.00,
                 "rollover": 0.00,
+                "rollover_type": "monthly",
+                "category_type": "expense",
+                "group_level_budgeting": None,
                 "month": "2026-03-01",
             }
         ]
 
-    async def test_groups_null_when_unavailable(self):
-        # Default fixture omits the group selection entirely.
-        assert json.loads(await get_budgets())["groups"] is None
+    async def test_groups_empty_when_query_ran_but_returned_none(self):
+        # Default fixture omits the group selection: the query succeeded, so
+        # [] (asked, none there) rather than null (could not ask).
+        assert json.loads(await get_budgets())["groups"] == []
+
+    async def test_group_rows_flag_authoritative_group_budgets(
+        self, mock_monarch_client
+    ):
+        enriched = with_flex(mock_monarch_client.gql_call.return_value)
+        enriched["categoryGroups"][0]["groupLevelBudgetingEnabled"] = True
+        mock_monarch_client.gql_call.return_value = enriched
+
+        groups = json.loads(await get_budgets())["groups"]
+
+        # True => the group holds the budget; False/None => it is a roll-up of
+        # its categories, and adding both double-counts.
+        assert groups[0]["group_level_budgeting"] is True
 
     async def test_surfaces_rollover_so_remaining_reconciles(
         self, mock_monarch_client
@@ -295,8 +362,25 @@ class TestFlexBucket:
         # Archived goals are surfaced but flagged, not silently dropped.
         assert goals[1]["archived"] is True
 
-    async def test_goals_null_when_unavailable(self):
-        assert json.loads(await get_budgets())["goals"] is None
+    async def test_goals_empty_when_account_has_none(self):
+        assert json.loads(await get_budgets())["goals"] == []
+
+    async def test_everything_extended_is_null_on_the_fallback_path(
+        self, mock_monarch_client
+    ):
+        # When the extended query is refused, null must mean "not available"
+        # across the board -- never zero, and never "the account has none".
+        base = mock_monarch_client.gql_call.return_value
+        mock_monarch_client.gql_call.side_effect = reject_flex_only(base)
+
+        result = json.loads(await get_budgets())
+
+        assert result["flex"]["status"] == "unsupported"
+        assert result["groups"] is None
+        assert result["goals"] is None
+        assert result["totals"] is None
+        assert result["budget_system"] is None
+        assert all(row["rollover"] is None for row in result["data"])
 
     async def test_prefers_the_flex_query(self, mock_monarch_client):
         await get_budgets()
@@ -308,7 +392,7 @@ class TestFlexBucket:
         result = json.loads(await get_budgets())
         assert result["flex"]["status"] == "not_configured"
         assert result["flex"]["monthly"] == []
-        assert result["totals"] is None
+        assert result["totals"] == []
         # Category rows are unaffected.
         assert len(result["data"]) == 2
 
@@ -331,7 +415,32 @@ class TestFlexBucket:
         ]
         assert operations == ["MCPBudgetDataFlex", "MCPBudgetData"]
 
-    async def test_caches_rejection_and_skips_retrying_flex(
+    async def test_a_transient_rejection_does_not_stick(self, mock_monarch_client):
+        # gql raises TransportQueryError for ANY GraphQL `errors` array --
+        # a rate limit, a resolver hiccup, a partial success. Caching
+        # "unsupported" off one of those would strip flex, groups, goals,
+        # totals and rollover from every later call for the whole process.
+        base = mock_monarch_client.gql_call.return_value
+        calls = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise monarch_rejection()
+            if kwargs.get("operation") == "MCPBudgetDataFlex":
+                return with_flex(base)
+            return base
+
+        mock_monarch_client.gql_call.side_effect = flaky
+
+        first = json.loads(await get_budgets())
+        second = json.loads(await get_budgets())
+
+        assert first["flex"]["status"] == "unsupported"
+        # Recovered rather than staying degraded.
+        assert second["flex"]["status"] == "ok"
+
+    async def test_retries_flex_on_every_call_when_rejected(
         self, mock_monarch_client
     ):
         base = mock_monarch_client.gql_call.return_value
@@ -344,14 +453,33 @@ class TestFlexBucket:
             call.kwargs["operation"]
             for call in mock_monarch_client.gql_call.call_args_list
         ]
-        # First call probes then falls back; the second goes straight to narrow.
+        # Each call re-probes: one extra round-trip is the price of never
+        # reporting a transient failure as a permanent account limitation.
         assert operations == [
             "MCPBudgetDataFlex",
             "MCPBudgetData",
+            "MCPBudgetDataFlex",
             "MCPBudgetData",
         ]
 
-    async def test_auth_error_propagates_and_does_not_disable_flex(
+    async def test_fallback_reuses_the_callers_date_range(
+        self, mock_monarch_client
+    ):
+        base = mock_monarch_client.gql_call.return_value
+        mock_monarch_client.gql_call.side_effect = reject_flex_only(base)
+
+        await get_budgets(start_date="2026-03-01", end_date="2026-03-31")
+
+        variables = [
+            call.kwargs["variables"]
+            for call in mock_monarch_client.gql_call.call_args_list
+        ]
+        assert variables[0] == variables[1] == {
+            "startDate": "2026-03-01",
+            "endDate": "2026-03-31",
+        }
+
+    async def test_auth_error_propagates_rather_than_degrading(
         self, mock_monarch_client
     ):
         mock_monarch_client.gql_call.side_effect = TransportServerError(
@@ -363,20 +491,17 @@ class TestFlexBucket:
         # Surfaced as an error rather than silently degraded to a partial answer.
         assert result["error"] is True
         assert result["tool"] == "get_budgets"
-        # A transport/auth failure must not latch flex off for the process.
-        assert budgets_module._flex_supported is None
 
-    async def test_does_not_latch_when_the_fallback_also_fails(
+    async def test_propagates_when_the_fallback_also_fails(
         self, mock_monarch_client
     ):
         # An expired session refuses BOTH queries. That is not evidence the
-        # account lacks flex, so flex must stay un-probed for the next attempt.
+        # account lacks flex, so it must surface as an error.
         mock_monarch_client.gql_call.side_effect = monarch_rejection()
 
         result = json.loads(await get_budgets())
 
         assert result["error"] is True
-        assert budgets_module._flex_supported is None
 
     @pytest.mark.parametrize(
         "exc,expected",
@@ -414,14 +539,19 @@ class TestSetFlexibleBudget:
             amount=2000, start_date=None, apply_to_future=True
         )
 
-    async def test_refuses_when_flex_known_unsupported(self, mock_monarch_client):
-        budgets_module._flex_supported = False
+    async def test_does_not_claim_success_without_confirmation(
+        self, mock_monarch_client
+    ):
+        # A 200 whose payload node is null is not a successful write. Reporting
+        # "$2000 set" off a no-op would have the model state a false number.
+        mock_monarch_client.update_flexible_budget.return_value = {
+            "updateOrCreateFlexBudgetItem": {"budgetItem": None}
+        }
 
-        result = json.loads(await set_flexible_budget(amount=100))
+        result = json.loads(await set_flexible_budget(amount=2000))
 
         assert result["success"] is False
-        assert "flexible budget" in result["error"].lower()
-        mock_monarch_client.update_flexible_budget.assert_not_awaited()
+        assert "did not confirm" in result["error"]
 
     async def test_reports_missing_client_method(self, mock_monarch_client):
         del mock_monarch_client.update_flexible_budget
@@ -439,7 +569,14 @@ class TestSetFlexibleBudget:
 
 
 class TestUpdateFlexRolloverSettings:
+    @staticmethod
+    def _on_flex_account(mock_monarch_client, system="fixed_and_flex"):
+        enriched = with_flex(mock_monarch_client.gql_call.return_value)
+        enriched["budgetSystem"] = system
+        mock_monarch_client.gql_call.return_value = enriched
+
     async def test_passes_explicit_values_through(self, mock_monarch_client):
+        self._on_flex_account(mock_monarch_client)
         mock_monarch_client.update_flex_rollover_settings.return_value = {
             "updateBudgetSettings": {"budgetRolloverPeriod": {"id": "rp-1"}}
         }
@@ -451,23 +588,37 @@ class TestUpdateFlexRolloverSettings:
         )
 
         assert result["success"] is True
+        # budget_system MUST be forwarded: the client defaults it to
+        # "fixed_and_flex" and writes it into the mutation input, so omitting
+        # it would stamp that system onto whatever account this runs against.
         mock_monarch_client.update_flex_rollover_settings.assert_awaited_once_with(
             rollover_start_month="2026-08-01",
             rollover_starting_balance=0,
             rollover_enabled=True,
+            budget_system="fixed_and_flex",
         )
 
-    def test_destructive_arguments_are_required(self):
-        # The client defaults to "balance 0, current month" -- a silent full
-        # reset. The tool must force the caller to state both explicitly.
-        import inspect
+    async def test_refuses_on_a_non_flex_account(self, mock_monarch_client):
+        # The mutation rewrites budgetSystem as a side effect. On an account
+        # using another system that would migrate the whole budgeting mode --
+        # far more than the rollover reset the user confirmed.
+        self._on_flex_account(mock_monarch_client, system="category_groups")
 
-        params = inspect.signature(update_flex_rollover_settings).parameters
-        assert params["rollover_start_month"].default is inspect.Parameter.empty
-        assert params["rollover_starting_balance"].default is inspect.Parameter.empty
+        result = json.loads(
+            await update_flex_rollover_settings(
+                rollover_start_month="2026-08-01", rollover_starting_balance=0
+            )
+        )
 
-    async def test_refuses_when_flex_known_unsupported(self, mock_monarch_client):
-        budgets_module._flex_supported = False
+        assert result["success"] is False
+        assert "category_groups" in result["error"]
+        mock_monarch_client.update_flex_rollover_settings.assert_not_awaited()
+
+    async def test_refuses_when_budget_system_cannot_be_read(
+        self, mock_monarch_client
+    ):
+        base = mock_monarch_client.gql_call.return_value
+        mock_monarch_client.gql_call.side_effect = reject_flex_only(base)
 
         result = json.loads(
             await update_flex_rollover_settings(
@@ -478,7 +629,17 @@ class TestUpdateFlexRolloverSettings:
         assert result["success"] is False
         mock_monarch_client.update_flex_rollover_settings.assert_not_awaited()
 
+    def test_destructive_arguments_are_required(self):
+        # The client defaults to "balance 0, current month" -- a silent full
+        # reset. The tool must force the caller to state both explicitly.
+        import inspect
+
+        params = inspect.signature(update_flex_rollover_settings).parameters
+        assert params["rollover_start_month"].default is inspect.Parameter.empty
+        assert params["rollover_starting_balance"].default is inspect.Parameter.empty
+
     async def test_reports_missing_client_method(self, mock_monarch_client):
+        self._on_flex_account(mock_monarch_client)
         del mock_monarch_client.update_flex_rollover_settings
 
         result = json.loads(
@@ -491,6 +652,7 @@ class TestUpdateFlexRolloverSettings:
         assert "update_flex_rollover_settings" in result["error"]
 
     async def test_handles_api_error(self, mock_monarch_client):
+        self._on_flex_account(mock_monarch_client)
         mock_monarch_client.update_flex_rollover_settings.side_effect = Exception(
             "boom"
         )

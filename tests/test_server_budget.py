@@ -1,6 +1,10 @@
 from monarch_mcp_server.tools.budgets import (
     BUDGET_QUERY,
     BUDGET_QUERY_FLEX,
+    BUDGET_QUERY_FLEX_OPERATION,
+    BUDGET_QUERY_OPERATION,
+    _CATEGORY_FIELD_EXTRA,
+    _GROUP_EXTRA,
     format_budget_data,
     format_budget_totals,
     format_flex_budget,
@@ -8,15 +12,11 @@ from monarch_mcp_server.tools.budgets import (
 
 
 def query_text(query):
-    # gql 4.0 returns a GraphQLRequest wrapping the parsed DocumentNode;
-    # the source string lives on document.loc.source.body. Earlier gql 3.x
-    # exposed .loc directly on the gql() return value.
-    return query.document.loc.source.body
-
-
-def category_groups_selection(text):
-    """The categoryGroups block -- the subtree implicated in the #15 failure."""
-    return text[text.index("categoryGroups {"):]
+    # gql 4.x returns a GraphQLRequest wrapping the parsed DocumentNode, with
+    # the source on document.loc; gql 3.x exposed .loc directly on the gql()
+    # return value. pyproject allows both, so support both.
+    node = getattr(query, "document", query)
+    return node.loc.source.body
 
 
 def test_budget_query_avoids_stale_category_group_fields():
@@ -42,21 +42,43 @@ def test_fallback_query_requests_nothing_beyond_the_proven_set():
         assert field not in text, f"{field} leaked into the fallback query"
 
 
-def test_flex_query_keeps_category_groups_narrow():
+def test_flex_query_adds_the_extended_selections():
     text = query_text(BUDGET_QUERY_FLEX)
 
-    # The flex query adds roll-up fields under budgetData...
-    assert "monthlyAmountsForFlexExpense" in text
-    assert "monthlyAmountsByCategoryGroup" in text
-    assert "totalsByMonth" in text
-    assert "totalIncome" in text
+    for field in (
+        "monthlyAmountsForFlexExpense",
+        "monthlyAmountsByCategoryGroup",
+        "totalsByMonth",
+        "totalIncome",
+        "goalsV2",
+        "budgetSystem",
+    ):
+        assert field in text
 
-    # ...but must not reintroduce the categoryGroups fields Monarch rejects.
-    # budgetVariability legitimately appears under monthlyAmountsForFlexExpense,
-    # so check the categoryGroups subtree specifically rather than the whole doc.
+
+def test_flex_query_does_not_reintroduce_the_rejected_group_fields():
+    # The #15 failure was CategoryGroup.budgetVariability / rolloverPeriod.
+    # The extended query may widen categoryGroups with groupLevelBudgetingEnabled
+    # and add budgetVariability on *categories* (both proven to work elsewhere
+    # in this server), but must not bring back the two fields that broke.
+    text = query_text(BUDGET_QUERY_FLEX)
+
     assert "rolloverPeriod" not in text
-    assert "groupLevelBudgetingEnabled" not in text
-    assert "budgetVariability" not in category_groups_selection(text)
+    # budgetVariability is legitimate under monthlyAmountsForFlexExpense and on
+    # categories; assert it never appears as a direct CategoryGroup field by
+    # checking the exact fragments the document is assembled from.
+    assert _GROUP_EXTRA.strip() == "groupLevelBudgetingEnabled"
+    assert _CATEGORY_FIELD_EXTRA.strip() == "budgetVariability"
+
+
+def test_documents_carry_the_operation_names_they_are_sent_under():
+    # get_budget_data passes `operation=` alongside `graphql_query=`, and the
+    # client forwards it as operation_name. A mismatch makes the server reject
+    # the request, which _is_query_rejection reads as "no flex here" -- so a
+    # swapped document would degrade silently instead of failing loudly.
+    assert f"query {BUDGET_QUERY_OPERATION}(" in query_text(BUDGET_QUERY)
+    assert f"query {BUDGET_QUERY_FLEX_OPERATION}(" in query_text(BUDGET_QUERY_FLEX)
+    assert BUDGET_QUERY_OPERATION != BUDGET_QUERY_FLEX_OPERATION
 
 
 def test_format_budget_data_returns_current_month_category_rows():
@@ -96,9 +118,74 @@ def test_format_budget_data_returns_current_month_category_rows():
             "rollover": None,
             "rollover_type": None,
             "category_group": "Food",
+            "category_type": None,
+            "budget_variability": None,
             "month": "2026-06-01",
         }
     ]
+
+
+def test_format_budget_data_carries_the_income_expense_marker():
+    # Income and expense amounts are both positive magnitudes, so without
+    # category_type a caller summing planned adds income to spending.
+    raw = {
+        "budgetData": {
+            "monthlyAmountsByCategory": [
+                {
+                    "category": {"id": "inc-1"},
+                    "monthlyAmounts": [
+                        {"month": "2026-06-01", "plannedCashFlowAmount": 8000}
+                    ],
+                },
+                {
+                    "category": {"id": "exp-1"},
+                    "monthlyAmounts": [
+                        {"month": "2026-06-01", "plannedCashFlowAmount": 500}
+                    ],
+                },
+            ]
+        },
+        "categoryGroups": [
+            {
+                "id": "g1",
+                "name": "Income",
+                "type": "income",
+                "categories": [{"id": "inc-1", "name": "Paycheck"}],
+            },
+            {
+                "id": "g2",
+                "name": "Food",
+                "type": "expense",
+                "categories": [
+                    {"id": "exp-1", "name": "Groceries",
+                     "budget_variability": None, "budgetVariability": "flexible"}
+                ],
+            },
+        ],
+    }
+
+    rows = {r["id"]: r for r in format_budget_data(raw)}
+
+    assert rows["inc-1"]["category_type"] == "income"
+    assert rows["exp-1"]["category_type"] == "expense"
+    assert rows["exp-1"]["budget_variability"] == "flexible"
+    spending = sum(
+        r["planned"] for r in rows.values() if r["category_type"] == "expense"
+    )
+    assert spending == 500
+
+
+def test_format_budget_data_tolerates_explicit_nulls():
+    for raw in (
+        {"budgetData": None, "categoryGroups": None},
+        {"budgetData": {"monthlyAmountsByCategory": None}, "categoryGroups": []},
+        {"budgetData": {"monthlyAmountsByCategory": [None]}, "categoryGroups": [None]},
+        {
+            "budgetData": {"monthlyAmountsByCategory": []},
+            "categoryGroups": [{"id": "g", "name": "G", "categories": None}],
+        },
+    ):
+        assert format_budget_data(raw) == []
 
 
 class TestFormatFlexBudget:
@@ -186,8 +273,10 @@ class TestFormatBudgetTotals:
     def test_none_when_fallback_query_was_used(self):
         assert format_budget_totals({"budgetData": {}}, used_flex_query=False) is None
 
-    def test_none_when_absent(self):
-        assert format_budget_totals({"budgetData": {}}, used_flex_query=True) is None
+    def test_empty_list_when_query_ran_but_returned_none(self):
+        # [] means "asked, none there"; None means "could not ask". Collapsing
+        # them is the ambiguity flex.status exists to avoid.
+        assert format_budget_totals({"budgetData": {}}, used_flex_query=True) == []
 
     def test_maps_each_bucket(self):
         raw = {
