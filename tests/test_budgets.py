@@ -672,6 +672,59 @@ class TestUpdateFlexRolloverSettings:
             budget_system="fixed_and_flex",
         )
 
+    async def test_does_not_claim_success_without_confirmation(
+        self, mock_monarch_client
+    ):
+        # The highest-stakes claim in this module: falsely confirming a
+        # DESTRUCTIVE rollover reset is worse than falsely confirming an
+        # amount, so the guard must not be silently removable.
+        self._on_flex_account(mock_monarch_client)
+        mock_monarch_client.update_flex_rollover_settings.return_value = {
+            "updateBudgetSettings": {"budgetRolloverPeriod": None}
+        }
+
+        result = json.loads(
+            await update_flex_rollover_settings(
+                rollover_start_month="2026-08-01", rollover_starting_balance=0
+            )
+        )
+
+        assert result["success"] is False
+        assert "did not confirm" in result["error"]
+
+    async def test_reports_the_month_monarch_applied(self, mock_monarch_client):
+        self._on_flex_account(mock_monarch_client)
+        mock_monarch_client.update_flex_rollover_settings.return_value = {
+            "updateBudgetSettings": {
+                "budgetRolloverPeriod": {"id": "rp-1", "startMonth": "2026-09-01"}
+            }
+        }
+
+        result = json.loads(
+            await update_flex_rollover_settings(
+                rollover_start_month="2026-08-01", rollover_starting_balance=0
+            )
+        )
+
+        # Echoing the requested month would misreport what actually happened.
+        assert "2026-09-01" in result["message"]
+
+    @pytest.mark.parametrize("bad", ["", "not-a-date", "2026-13-01"])
+    async def test_rejects_a_malformed_start_month(self, bad, mock_monarch_client):
+        # The client does `rollover_start_month or <current month>`, so an
+        # empty string would become a silent full reset -- the exact thing the
+        # required arguments exist to prevent.
+        self._on_flex_account(mock_monarch_client)
+
+        result = json.loads(
+            await update_flex_rollover_settings(
+                rollover_start_month=bad, rollover_starting_balance=0
+            )
+        )
+
+        assert result["success"] is False
+        mock_monarch_client.update_flex_rollover_settings.assert_not_awaited()
+
     async def test_refuses_on_a_non_flex_account(self, mock_monarch_client):
         # The mutation rewrites budgetSystem as a side effect. On an account
         # using another system that would migrate the whole budgeting mode --

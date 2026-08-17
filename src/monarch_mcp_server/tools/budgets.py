@@ -532,10 +532,10 @@ def format_group_budgets(
 
     ``None`` means "could not ask"; ``[]`` means none were returned.
 
-    ``group_level_budgeting`` is the important field: when True the group holds
-    its own budget, and when False this row is merely the roll-up of its
-    categories. A caller that adds ``data[].planned`` to ``groups[].planned``
-    without checking it double-counts.
+    ``group_level_budgeting`` says which level holds the real budget: when True
+    the group does and its categories carry none; when False this row is merely
+    the roll-up of its categories. Adding ``groups[].planned`` to the matching
+    ``data[].planned`` double-counts either way.
     """
     if not used_flex_query:
         return None
@@ -662,7 +662,15 @@ async def get_budgets(
         id), ``name``, ``planned`` (planned cash-flow amount), ``actual``,
         ``remaining``, ``set_aside``, ``rollover``, ``rollover_type``,
         ``category_group``, ``category_type`` (``income`` / ``expense`` /
-        ``transfer``), ``budget_variability`` and ``month``. ``planned`` minus
+        ``transfer``), ``budget_variability`` and ``month``.
+
+        ``set_aside`` is Monarch's ``plannedSetAsideAmount``, passed through
+        as-is. It is a distinct field from ``planned`` and this server does not
+        combine them; whether Monarch intends it as additive to ``planned`` has
+        not been confirmed against an account that actually uses it, so do not
+        sum the two without checking against Monarch's own figures.
+
+        ``planned`` minus
         ``actual`` equals ``remaining`` only when ``rollover`` is zero; for
         rollover categories the carried balance accounts for the difference.
 
@@ -897,11 +905,21 @@ async def update_flex_rollover_settings(
         Result of the update, including the new rollover period.
     """
     try:
-        message = (
-            f"Flex rollover period restarted at {rollover_start_month} with "
-            f"a starting balance of ${float(rollover_starting_balance):.2f}"
-            + ("" if rollover_enabled else " (rollover disabled)")
-        )
+        # The client does `rollover_start_month or <current month>`, so an
+        # empty or malformed value silently becomes "reset from this month" --
+        # exactly the no-argument reset the required arguments exist to
+        # prevent. Reject it here rather than letting it through.
+        try:
+            date.fromisoformat(rollover_start_month)
+        except (TypeError, ValueError):
+            return json_success({
+                "success": False,
+                "error": (
+                    "rollover_start_month must be a YYYY-MM-DD date (use the "
+                    f"first of the month, e.g. '2026-08-01'); got "
+                    f"{rollover_start_month!r}."
+                ),
+            })
 
         client = await get_monarch_client()
 
@@ -981,9 +999,15 @@ async def update_flex_rollover_settings(
                 "result": result,
             })
 
+        # Report the month Monarch actually applied, not the one requested.
+        applied_month = period.get("startMonth") or rollover_start_month
         return json_success({
             "success": True,
-            "message": message,
+            "message": (
+                f"Flex rollover period restarted at {applied_month} with a "
+                f"starting balance of ${float(rollover_starting_balance):.2f}"
+                + ("" if rollover_enabled else " (rollover disabled)")
+            ),
             "budget_system": budget_system,
             "result": result,
         })
